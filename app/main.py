@@ -455,6 +455,36 @@ async def tiktok_info(c: httpx.AsyncClient, url: str, out: dict) -> str:
     return ""
 
 
+FB_UA = "facebookexternalhit/1.1 (+http://www.facebook.com/externalhit_uatext.php)"
+
+
+async def instagram_info(c: httpx.AsyncClient, url: str, out: dict) -> str:
+    """Instagram ne montre la légende qu'aux robots d'aperçu de lien (Facebook, WhatsApp…)."""
+    clean = url.split("?")[0]
+    try:
+        r = await c.get(clean, headers={"User-Agent": FB_UA, "Accept-Language": "fr-FR,fr;q=0.9"})
+    except httpx.HTTPError as e:
+        log.info("Instagram %s : erreur réseau %s", clean, e)
+        return ""
+    html = r.text[:3_000_000] if r.status_code < 400 else ""
+    log.info("Instagram %s : HTTP %s, %s octets", clean, r.status_code, len(r.content))
+    if not html:
+        return ""
+    desc = _meta(html, "og:description") or _meta(html, "description")
+    # « 1 234 likes, 56 comments - auteur le 3 novembre 2026: "la légende" »
+    m = re.match(r'^.*?(?:comments?|commentaires?)\s*-\s*([\w.]+)[^:]*:\s*["“](.*)["”]\.?\s*$', desc, re.S)
+    if m:
+        out["author"], desc = m.group(1), m.group(2)
+    if not out["author"]:
+        t = _meta(html, "og:title")
+        m2 = re.match(r"^(.+?) (?:on|sur) Instagram", t)
+        if m2:
+            out["author"] = m2.group(1)
+    out["caption"] = desc
+    log.info("Instagram : légende %s", "trouvée" if desc else "absente")
+    return _meta(html, "og:image")
+
+
 async def fetch_link_info(url: str) -> dict:
     """Récupère la légende, l'auteur et la miniature d'une vidéo ou d'une page."""
     out = {"caption": "", "author": "", "thumb": None, "platform": "", "url": url}
@@ -481,6 +511,8 @@ async def fetch_link_info(url: str) -> dict:
                     desc = _meta(page, "og:description") or _meta(page, "description")
                     if desc:
                         out["caption"] = f"{out['caption']}\n\n{desc}".strip()
+            elif "instagram" in host:
+                thumb_url = await instagram_info(c, url, out)
             else:
                 t = _text(await _get_limited(c, url, 3_000_000))
                 if t:
