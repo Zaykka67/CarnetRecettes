@@ -1,0 +1,578 @@
+"""Carnet de recettes — serveur FastAPI.
+
+- Stocke les recettes dans SQLite et les photos sur disque (dossier DATA_DIR).
+- Protège l'appli par un mot de passe unique (APP_PASSWORD).
+- Importe une recette depuis un lien (TikTok, YouTube, Instagram, site web) :
+  récupère la description et la miniature de la vidéo, puis demande à Claude
+  (API Anthropic) d'en faire une fiche recette.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import base64
+import hashlib
+import hmac
+import html as html_lib
+import io
+import ipaddress
+import json
+import logging
+import os
+import re
+import socket
+import sqlite3
+import time
+import uuid
+from pathlib import Path
+from urllib.parse import urlparse
+
+import httpx
+from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
+from fastapi.responses import FileResponse, JSONResponse, Response
+from fastapi.staticfiles import StaticFiles
+from PIL import Image, ImageOps
+
+log = logging.getLogger("carnet")
+logging.basicConfig(level=logging.INFO)
+
+# --------------------------------------------------------------------------
+# Configuration
+# --------------------------------------------------------------------------
+DATA_DIR = Path(os.getenv("DATA_DIR", "/data"))
+PHOTOS_DIR = DATA_DIR / "photos"
+PHOTOS_DIR.mkdir(parents=True, exist_ok=True)
+DB_PATH = DATA_DIR / "recettes.db"
+STATIC_DIR = Path(__file__).parent / "static"
+
+APP_PASSWORD = os.getenv("APP_PASSWORD", "")
+SECRET_KEY = os.getenv("SECRET_KEY", "") or hashlib.sha256(("carnet:" + APP_PASSWORD).encode()).hexdigest()
+ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
+ANTHROPIC_MODEL = os.getenv("ANTHROPIC_MODEL", "claude-sonnet-5-5")
+ANTHROPIC_BASE_URL = os.getenv("ANTHROPIC_BASE_URL", "https://api.anthropic.com").rstrip("/")
+
+COOKIE = "carnet_session"
+SESSION_DAYS = 365
+MAX_UPLOAD = 15 * 1024 * 1024
+MAX_SHOTS = 6
+
+SEASONS = ["printemps", "ete", "automne", "hiver"]
+CATEGORIES = ["Apéro", "Entrée", "Plat", "Accompagnement", "Dessert", "Petit-déj", "Boisson", "Sauce"]
+UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+      "(KHTML, like Gecko) Chrome/131.0 Safari/537.36")
+
+if not APP_PASSWORD:
+    log.warning("APP_PASSWORD n'est pas défini : l'appli est accessible sans mot de passe.")
+if not ANTHROPIC_API_KEY:
+    log.warning("ANTHROPIC_API_KEY n'est pas défini : l'import automatique est désactivé.")
+
+# --------------------------------------------------------------------------
+# Base de données
+# --------------------------------------------------------------------------
+def db() -> sqlite3.Connection:
+    con = sqlite3.connect(DB_PATH)
+    con.row_factory = sqlite3.Row
+    return con
+
+
+with db() as _c:
+    _c.execute("""CREATE TABLE IF NOT EXISTS recipes(
+        id TEXT PRIMARY KEY, data TEXT NOT NULL,
+        created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL)""")
+
+
+def now_ms() -> int:
+    return int(time.time() * 1000)
+
+
+def row_to_recipe(row: sqlite3.Row) -> dict:
+    d = json.loads(row["data"])
+    d["id"] = row["id"]
+    d["createdAt"] = row["created_at"]
+    d["updatedAt"] = row["updated_at"]
+    return d
+
+
+def get_recipe(rid: str) -> dict | None:
+    with db() as c:
+        row = c.execute("SELECT * FROM recipes WHERE id=?", (rid,)).fetchone()
+    return row_to_recipe(row) if row else None
+
+
+# --------------------------------------------------------------------------
+# Nettoyage des données reçues
+# --------------------------------------------------------------------------
+def _s(v, n=500) -> str:
+    return str(v or "").strip()[:n]
+
+
+def _int(v):
+    try:
+        n = int(round(float(v)))
+        return n if 0 <= n < 100000 else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _num(v):
+    try:
+        n = float(v)
+        return n if 0 <= n < 1e6 else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _url(v) -> str:
+    u = _s(v, 1000)
+    return u if re.match(r"^https?://", u, re.I) else ""
+
+
+def clean_recipe(d: dict) -> dict:
+    photo = d.get("photo") if isinstance(d.get("photo"), dict) else None
+    pid = photo.get("id") if photo else None
+    return {
+        "title": _s(d.get("title"), 160) or "Sans titre",
+        "description": _s(d.get("description"), 400),
+        "category": d.get("category") if d.get("category") in CATEGORIES else "Plat",
+        "seasons": [s for s in SEASONS if s in (d.get("seasons") or [])],
+        "prepMin": _int(d.get("prepMin")),
+        "cookMin": _int(d.get("cookMin")),
+        "servings": _int(d.get("servings")) or None,
+        "ingredients": [
+            {"qty": _num(i.get("qty")), "unit": _s(i.get("unit"), 30), "name": _s(i.get("name"), 200)}
+            for i in (d.get("ingredients") or [])[:80]
+            if isinstance(i, dict) and _s(i.get("name"))
+        ],
+        "steps": [_s(s, 2000) for s in (d.get("steps") or [])[:60] if _s(s)],
+        "tips": _s(d.get("tips"), 2000),
+        "tags": [_s(t, 40).lstrip("#") for t in (d.get("tags") or [])[:10] if _s(t)],
+        "sourceUrl": _url(d.get("sourceUrl")),
+        "favorite": bool(d.get("favorite")),
+        "photo": {"id": pid} if isinstance(pid, str) and re.fullmatch(r"[a-f0-9]{32}", pid) else None,
+    }
+
+
+# --------------------------------------------------------------------------
+# Photos
+# --------------------------------------------------------------------------
+def save_image(raw: bytes, max_side: int = 1600) -> str:
+    try:
+        img = Image.open(io.BytesIO(raw))
+        img = ImageOps.exif_transpose(img)
+        img = img.convert("RGB")
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(400, "Image illisible.") from e
+    img.thumbnail((max_side, max_side))
+    pid = uuid.uuid4().hex
+    img.save(PHOTOS_DIR / f"{pid}.jpg", "JPEG", quality=84, optimize=True)
+    return pid
+
+
+def image_b64(raw: bytes, max_side: int = 1200) -> str:
+    img = ImageOps.exif_transpose(Image.open(io.BytesIO(raw))).convert("RGB")
+    img.thumbnail((max_side, max_side))
+    buf = io.BytesIO()
+    img.save(buf, "JPEG", quality=82)
+    return base64.b64encode(buf.getvalue()).decode()
+
+
+def delete_photo(photo: dict | None) -> None:
+    if photo and photo.get("id"):
+        p = PHOTOS_DIR / f"{photo['id']}.jpg"
+        p.unlink(missing_ok=True)
+
+
+# --------------------------------------------------------------------------
+# Session
+# --------------------------------------------------------------------------
+def make_token() -> str:
+    exp = str(int(time.time()) + SESSION_DAYS * 86400)
+    sig = hmac.new(SECRET_KEY.encode(), exp.encode(), hashlib.sha256).hexdigest()
+    return f"{exp}.{sig}"
+
+
+def is_authed(request: Request) -> bool:
+    if not APP_PASSWORD:
+        return True
+    tok = request.cookies.get(COOKIE, "")
+    exp, _, sig = tok.partition(".")
+    if not exp.isdigit() or int(exp) < time.time():
+        return False
+    good = hmac.new(SECRET_KEY.encode(), exp.encode(), hashlib.sha256).hexdigest()
+    return hmac.compare_digest(sig, good)
+
+
+# --------------------------------------------------------------------------
+# Application
+# --------------------------------------------------------------------------
+app = FastAPI(title="Carnet de recettes", docs_url=None, redoc_url=None)
+
+PUBLIC_API = {"/api/login", "/api/config"}
+
+
+@app.middleware("http")
+async def auth_mw(request: Request, call_next):
+    p = request.url.path
+    protected = (p.startswith("/api/") and p not in PUBLIC_API) or p.startswith("/photos/")
+    if protected and not is_authed(request):
+        return JSONResponse({"detail": "Connexion requise."}, status_code=401)
+    return await call_next(request)
+
+
+@app.get("/api/config")
+async def config(request: Request):
+    return {"ai": bool(ANTHROPIC_API_KEY), "auth": bool(APP_PASSWORD), "loggedIn": is_authed(request)}
+
+
+@app.post("/api/login")
+async def login(request: Request):
+    body = await request.json()
+    pwd = str(body.get("password", ""))
+    if not APP_PASSWORD or not hmac.compare_digest(pwd.encode(), APP_PASSWORD.encode()):
+        await asyncio.sleep(1.5)
+        raise HTTPException(401, "Mot de passe incorrect.")
+    resp = JSONResponse({"ok": True})
+    secure = request.headers.get("x-forwarded-proto", request.url.scheme) == "https"
+    resp.set_cookie(COOKIE, make_token(), max_age=SESSION_DAYS * 86400, httponly=True,
+                    secure=secure, samesite="lax", path="/")
+    return resp
+
+
+@app.post("/api/logout")
+async def logout():
+    resp = JSONResponse({"ok": True})
+    resp.delete_cookie(COOKIE, path="/")
+    return resp
+
+
+# ---- Recettes ----------------------------------------------------------------
+@app.get("/api/recipes")
+async def list_recipes():
+    with db() as c:
+        rows = c.execute("SELECT * FROM recipes ORDER BY created_at DESC").fetchall()
+    return [row_to_recipe(r) for r in rows]
+
+
+@app.post("/api/recipes")
+async def create_recipe(request: Request):
+    data = clean_recipe(await request.json())
+    rid, ts = uuid.uuid4().hex[:12], now_ms()
+    with db() as c:
+        c.execute("INSERT INTO recipes VALUES (?,?,?,?)", (rid, json.dumps(data, ensure_ascii=False), ts, ts))
+    return get_recipe(rid)
+
+
+@app.put("/api/recipes/{rid}")
+async def replace_recipe(rid: str, request: Request):
+    old = get_recipe(rid)
+    if not old:
+        raise HTTPException(404, "Recette introuvable.")
+    data = clean_recipe(await request.json())
+    if (old.get("photo") or {}).get("id") != (data.get("photo") or {}).get("id"):
+        delete_photo(old.get("photo"))
+    with db() as c:
+        c.execute("UPDATE recipes SET data=?, updated_at=? WHERE id=?",
+                  (json.dumps(data, ensure_ascii=False), now_ms(), rid))
+    return get_recipe(rid)
+
+
+@app.patch("/api/recipes/{rid}")
+async def patch_recipe(rid: str, request: Request):
+    old = get_recipe(rid)
+    if not old:
+        raise HTTPException(404, "Recette introuvable.")
+    body = await request.json()
+    if "favorite" in body:
+        old["favorite"] = bool(body["favorite"])
+    data = clean_recipe(old)
+    with db() as c:
+        c.execute("UPDATE recipes SET data=?, updated_at=? WHERE id=?",
+                  (json.dumps(data, ensure_ascii=False), now_ms(), rid))
+    return get_recipe(rid)
+
+
+@app.delete("/api/recipes/{rid}")
+async def delete_recipe(rid: str):
+    old = get_recipe(rid)
+    if old:
+        delete_photo(old.get("photo"))
+        with db() as c:
+            c.execute("DELETE FROM recipes WHERE id=?", (rid,))
+    return Response(status_code=204)
+
+
+# ---- Photos ------------------------------------------------------------------
+@app.post("/api/photos")
+async def upload_photo(file: UploadFile = File(...)):
+    raw = await file.read(MAX_UPLOAD + 1)
+    if len(raw) > MAX_UPLOAD:
+        raise HTTPException(413, "Image trop lourde (15 Mo maximum).")
+    return {"id": save_image(raw)}
+
+
+@app.get("/photos/{pid}")
+async def get_photo(pid: str):
+    pid = pid.removesuffix(".jpg")
+    if not re.fullmatch(r"[a-f0-9]{32}", pid):
+        raise HTTPException(404)
+    p = PHOTOS_DIR / f"{pid}.jpg"
+    if not p.exists():
+        raise HTTPException(404)
+    return FileResponse(p, media_type="image/jpeg", headers={"Cache-Control": "private, max-age=31536000, immutable"})
+
+
+# ---- Import depuis un lien ------------------------------------------------------
+def _public_host(host: str) -> bool:
+    """Refuse les adresses internes (localhost, réseau privé…)."""
+    try:
+        infos = socket.getaddrinfo(host, None)
+    except socket.gaierror:
+        return False
+    for info in infos:
+        ip = ipaddress.ip_address(info[4][0])
+        if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved or ip.is_multicast:
+            return False
+    return True
+
+
+def _platform(host: str) -> str:
+    h = host.lower()
+    for key, name in (("tiktok", "TikTok"), ("instagram", "Instagram"), ("youtu", "YouTube"),
+                      ("facebook", "Facebook"), ("fb.watch", "Facebook"), ("pinterest", "Pinterest"), ("pin.it", "Pinterest")):
+        if key in h:
+            return name
+    return h.removeprefix("www.")
+
+
+def _meta(html: str, prop: str) -> str:
+    for pat in (rf'<meta[^>]+(?:property|name)=["\']{prop}["\'][^>]+content=["\']([^"\']*)',
+                rf'<meta[^>]+content=["\']([^"\']*)["\'][^>]+(?:property|name)=["\']{prop}["\']'):
+        m = re.search(pat, html, re.I)
+        if m:
+            return html_lib.unescape(m.group(1)).strip()
+    return ""
+
+
+async def _get_limited(client: httpx.AsyncClient, url: str, limit: int) -> bytes | None:
+    """Télécharge au plus `limit` octets, uniquement depuis une adresse publique."""
+    host = urlparse(url).hostname or ""
+    if not host or not _public_host(host):
+        return None
+    async with client.stream("GET", url) as r:
+        if r.status_code >= 400:
+            return None
+        chunks, size = [], 0
+        async for chunk in r.aiter_bytes():
+            size += len(chunk)
+            if size > limit:
+                break
+            chunks.append(chunk)
+    return b"".join(chunks)
+
+
+def _text(raw: bytes | None) -> str:
+    return raw.decode("utf-8", errors="replace") if raw else ""
+
+
+async def fetch_link_info(url: str) -> dict:
+    """Récupère la légende, l'auteur et la miniature d'une vidéo ou d'une page."""
+    out = {"caption": "", "author": "", "thumb": None, "platform": "", "url": url}
+    if not re.match(r"^https?://", url, re.I):
+        return out
+    async with httpx.AsyncClient(follow_redirects=True, timeout=15, headers={"User-Agent": UA, "Accept-Language": "fr-FR,fr;q=0.9"}) as c:
+        try:
+            host = (urlparse(url).hostname or "").lower()
+            # Liens courts TikTok (vm.tiktok.com, /t/...) : on suit la redirection
+            if "tiktok" in host and ("vm." in host or "vt." in host or "/t/" in url):
+                r = await c.get(url)
+                url = str(r.url).split("?")[0]
+                out["url"] = url
+                host = (urlparse(url).hostname or "").lower()
+            out["platform"] = _platform(host)
+            thumb_url = ""
+            if "tiktok" in host:
+                r = await c.get("https://www.tiktok.com/oembed", params={"url": url})
+                if r.status_code == 200:
+                    j = r.json()
+                    out["caption"], out["author"], thumb_url = j.get("title", ""), j.get("author_name", ""), j.get("thumbnail_url", "")
+            elif "youtu" in host:
+                r = await c.get("https://www.youtube.com/oembed", params={"url": url, "format": "json"})
+                if r.status_code == 200:
+                    j = r.json()
+                    out["caption"], out["author"], thumb_url = j.get("title", ""), j.get("author_name", ""), j.get("thumbnail_url", "")
+                page = _text(await _get_limited(c, url, 3_000_000))
+                if page:
+                    desc = _meta(page, "og:description") or _meta(page, "description")
+                    if desc:
+                        out["caption"] = f"{out['caption']}\n\n{desc}".strip()
+            else:
+                t = _text(await _get_limited(c, url, 3_000_000))
+                if t:
+                    title = _meta(t, "og:title")
+                    desc = _meta(t, "og:description") or _meta(t, "description")
+                    out["caption"] = "\n\n".join(x for x in (title, desc) if x)
+                    thumb_url = _meta(t, "og:image")
+                    # Recette structurée (schema.org) présente sur la plupart des sites de cuisine
+                    for m in re.finditer(r'<script[^>]+application/ld\+json[^>]*>(.*?)</script>', t, re.S | re.I):
+                        if '"Recipe"' in m.group(1):
+                            out["caption"] += "\n\nDonnées structurées de la page :\n" + m.group(1)[:15000]
+                            break
+            if thumb_url and re.match(r"^https?://", thumb_url):
+                raw = await _get_limited(c, thumb_url, 8_000_000)
+                if raw:
+                    out["thumb"] = raw
+        except (httpx.HTTPError, ValueError) as e:
+            log.info("Lecture du lien impossible (%s) : %s", url, e)
+    return out
+
+
+IMPORT_PROMPT = """Tu aides à remplir un carnet de recettes personnel, en français.
+À partir des éléments ci-dessous (légende d'une vidéo de recette TikTok, Instagram, YouTube ou d'une page web, texte collé par l'utilisateur, et images), retranscris la recette.
+
+{images_desc}
+
+Règles :
+- N'invente pas de quantité absente : mets "qty": null. Une quantité lisible dans le texte ou sur une image doit être reprise.
+- "qty" est un nombre (0.5 pour un demi). "unit" est court : g, kg, ml, cl, l, c. à s., c. à c., pincée, gousse, tranche, sachet, botte… ou "" pour une pièce (ex. 3 œufs).
+- "name" est l'ingrédient seul, sans "de" au début.
+- Étapes courtes et claires, à l'impératif, dans l'ordre. Corrige les fautes, retire emojis, hashtags et appels à s'abonner.
+- Si la légende ne donne que les ingrédients, déduis des étapes simples et logiques, et signale-le dans "notes".
+- "seasons" : parmi ["printemps","ete","automne","hiver"] selon la saisonnalité en France des ingrédients frais principaux ; tableau vide si la recette se cuisine toute l'année.
+- "category" : une valeur parmi {categories}.
+- "prepMin", "cookMin", "servings" : entiers, estime-les raisonnablement s'ils sont absents.
+- "coverImageIndex" : numéro de l'image qui montre le mieux le plat fini, ou null s'il n'y a pas d'image.
+- "notes" : une phrase courte sur ce qui manquait ou a été déduit, ou "".
+- "tags" : 1 à 4 mots-clés courts en minuscules.
+
+Réponds uniquement avec un objet JSON de cette forme :
+{{"title":"Velouté de potimarron","description":"Une phrase qui donne envie.","category":"Entrée","seasons":["automne"],"prepMin":15,"cookMin":30,"servings":4,"ingredients":[{{"qty":1,"unit":"","name":"potimarron"}},{{"qty":20,"unit":"cl","name":"crème liquide"}}],"steps":["Coupe le potimarron en cubes."],"tips":"","tags":["soupe"],"coverImageIndex":0,"notes":""}}
+Si les éléments ne contiennent aucune recette exploitable, réponds {{"error":"explication courte en français"}}.
+
+Lien : {url}
+Auteur : {author}
+
+Légende de la vidéo / texte de la page :
+\"\"\"
+{caption}
+\"\"\"
+
+Texte ajouté par l'utilisateur :
+\"\"\"
+{user_text}
+\"\"\"
+"""
+
+
+def parse_json_reply(text: str) -> dict:
+    text = text.strip()
+    fence = re.search(r"```(?:json)?\s*(.*?)```", text, re.S)
+    if fence:
+        text = fence.group(1)
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        a, b = text.find("{"), text.rfind("}")
+        if a >= 0 and b > a:
+            return json.loads(text[a:b + 1])
+        raise
+
+
+@app.post("/api/import")
+async def import_recipe(url: str = Form(""), caption: str = Form(""),
+                        images: list[UploadFile] | None = File(None)):
+    if not ANTHROPIC_API_KEY:
+        raise HTTPException(503, "L'import automatique n'est pas configuré (clé API Anthropic manquante).")
+    url = url.strip()
+    shots: list[bytes] = []
+    for f in (images or [])[:MAX_SHOTS]:
+        raw = await f.read(MAX_UPLOAD + 1)
+        if raw and len(raw) <= MAX_UPLOAD:
+            shots.append(raw)
+
+    info = await fetch_link_info(url) if url else {"caption": "", "author": "", "thumb": None, "platform": "", "url": ""}
+    all_imgs = shots + ([info["thumb"]] if info["thumb"] else [])
+
+    if not (info["caption"].strip() or caption.strip() or all_imgs):
+        raise HTTPException(422, "Je n'ai rien pu lire depuis ce lien. Colle la description de la vidéo ou ajoute des captures d'écran.")
+
+    lines = []
+    for i in range(len(shots)):
+        lines.append(f"Image {i} : capture d'écran de la vidéo envoyée par l'utilisateur.")
+    if info["thumb"]:
+        lines.append(f"Image {len(shots)} : miniature de la vidéo.")
+    images_desc = "\n".join(lines) if lines else "Aucune image."
+
+    content: list[dict] = []
+    for raw in all_imgs:
+        try:
+            content.append({"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": image_b64(raw)}})
+        except Exception:  # noqa: BLE001
+            content.append({"type": "text", "text": "(image illisible)"})
+    content.append({"type": "text", "text": IMPORT_PROMPT.format(
+        images_desc=images_desc, categories=json.dumps(CATEGORIES, ensure_ascii=False),
+        url=info["url"] or url or "(aucun)", author=info["author"] or "(inconnu)",
+        caption=(info["caption"] or "(rien trouvé)")[:20000], user_text=(caption or "(rien)")[:12000])})
+
+    try:
+        async with httpx.AsyncClient(timeout=180) as c:
+            r = await c.post(f"{ANTHROPIC_BASE_URL}/v1/messages",
+                             headers={"x-api-key": ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01",
+                                      "content-type": "application/json"},
+                             json={"model": ANTHROPIC_MODEL, "max_tokens": 4096,
+                                   "messages": [{"role": "user", "content": content}]})
+    except httpx.HTTPError as e:
+        raise HTTPException(502, "Impossible de joindre Claude. Réessaie dans un instant.") from e
+    if r.status_code != 200:
+        log.warning("API Anthropic %s : %s", r.status_code, r.text[:500])
+        msg = {401: "La clé API Anthropic est refusée. Vérifie ANTHROPIC_API_KEY.",
+               404: f"Le modèle « {ANTHROPIC_MODEL} » est introuvable. Vérifie ANTHROPIC_MODEL.",
+               429: "Trop de demandes envoyées à Claude. Réessaie dans une minute.",
+               529: "Claude est surchargé. Réessaie dans une minute."}.get(r.status_code, "Claude n'a pas pu répondre. Réessaie.")
+        raise HTTPException(502, msg)
+
+    text = "".join(b.get("text", "") for b in r.json().get("content", []) if b.get("type") == "text")
+    try:
+        res = parse_json_reply(text)
+    except (json.JSONDecodeError, ValueError):
+        raise HTTPException(502, "La réponse de Claude était incomplète. Relance l'import.")
+    if not isinstance(res, dict) or res.get("error"):
+        raise HTTPException(422, f"Pas de recette trouvée : {res.get('error') if isinstance(res, dict) else 'réponse vide'}")
+
+    idx = res.get("coverImageIndex")
+    cover = all_imgs[idx] if isinstance(idx, int) and 0 <= idx < len(all_imgs) else (info["thumb"] or (shots[-1] if shots else None))
+    photo = None
+    if cover:
+        try:
+            photo = {"id": save_image(cover)}
+        except HTTPException:
+            photo = None
+
+    res["sourceUrl"] = info["url"] or url
+    res["photo"] = photo
+    draft = clean_recipe(res)
+    draft["favorite"] = False
+    return {"draft": draft, "notes": _s(res.get("notes"), 400),
+            "captionFound": bool(info["caption"].strip()), "platform": info["platform"]}
+
+
+# --------------------------------------------------------------------------
+# Pages
+# --------------------------------------------------------------------------
+@app.get("/share")
+async def share_page():
+    # Cible du menu « Partager » (Android) : on sert l'appli, qui lit les paramètres
+    return FileResponse(STATIC_DIR / "index.html", headers={"Cache-Control": "no-cache"})
+
+
+@app.get("/sw.js")
+async def service_worker():
+    return FileResponse(STATIC_DIR / "sw.js", media_type="text/javascript",
+                        headers={"Cache-Control": "no-cache", "Service-Worker-Allowed": "/"})
+
+
+@app.get("/healthz")
+async def health():
+    return {"ok": True}
+
+
+app.mount("/", StaticFiles(directory=STATIC_DIR, html=True), name="static")

@@ -1,0 +1,15 @@
+services:
+  carnet:
+    build: .
+    restart: unless-stopped
+    environment:
+      APP_PASSWORD: ${APP_PASSWORD}
+      SECRET_KEY: ${SECRET_KEY}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}
+      ANTHROPIC_MODEL: ${ANTHROPIC_MODEL:-claude-sonnet-5-5}
+    volumes:
+      - carnet-data:/data
+    ports:
+      - "8000:8000"
+volumes:
+  carnet-data:
