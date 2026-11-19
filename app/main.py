@@ -460,7 +460,11 @@ async def fetch_link_info(url: str) -> dict:
     out = {"caption": "", "author": "", "thumb": None, "platform": "", "url": url}
     if not re.match(r"^https?://", url, re.I):
         return out
-    async with httpx.AsyncClient(follow_redirects=True, timeout=15, headers={"User-Agent": UA, "Accept-Language": "fr-FR,fr;q=0.9"}) as c:
+    # IPv4 forcé : dans Docker, une route IPv6 absente fait attendre chaque requête jusqu'au délai maximum
+    transport = httpx.AsyncHTTPTransport(local_address="0.0.0.0", retries=1)
+    timeout = httpx.Timeout(10.0, connect=5.0)
+    async with httpx.AsyncClient(follow_redirects=True, timeout=timeout, transport=transport,
+                                 headers={"User-Agent": UA, "Accept-Language": "fr-FR,fr;q=0.9"}) as c:
         try:
             host = (urlparse(url).hostname or "").lower()
             out["platform"] = _platform(host)
@@ -559,7 +563,17 @@ async def import_recipe(url: str = Form(""), caption: str = Form(""),
         if raw and len(raw) <= MAX_UPLOAD:
             shots.append(raw)
 
-    info = await fetch_link_info(url) if url else {"caption": "", "author": "", "thumb": None, "platform": "", "url": ""}
+    empty = {"caption": "", "author": "", "thumb": None, "platform": "", "url": url}
+    info = empty
+    if url:
+        t0 = time.time()
+        try:
+            info = await asyncio.wait_for(fetch_link_info(url), timeout=30)
+        except asyncio.TimeoutError:
+            log.info("Lecture du lien abandonnée après 30 s : %s", url)
+            info = {**empty, "platform": _platform(urlparse(url).hostname or "")}
+        log.info("Lecture du lien en %.1f s (légende %s, miniature %s)", time.time() - t0,
+                 "oui" if info["caption"] else "non", "oui" if info["thumb"] else "non")
     all_imgs = shots + ([info["thumb"]] if info["thumb"] else [])
 
     if not (info["caption"].strip() or caption.strip() or all_imgs):
