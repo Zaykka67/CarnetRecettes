@@ -125,9 +125,17 @@ def shrink_video(path: str, tmp: str) -> bytes | None:
         return None
 
 
-def audio_and_frames(video: bytes, duration: float | None, n_frames: int = 8) -> tuple[bytes | None, list[bytes]]:
-    """Extrait la bande-son (mono, 32 kb/s) et quelques images de la vidéo.
-    Bien plus rapide à analyser pour Gemini que la vidéo complète."""
+def frame_times(duration: float | None, n_spread: int, n_end: int) -> list[float]:
+    """Instants à extraire : répartis sur la vidéo + plusieurs vers la fin (plat terminé)."""
+    dur = float(duration or 0) or 60.0
+    times = [dur * (i + 1) / (n_spread + 1) for i in range(n_spread)]
+    times += [dur * f for f in (0.82, 0.9, 0.96)[-n_end:]] if n_end else []
+    return sorted({round(min(max(t, 0.3), max(dur - 0.3, 0.3)), 1) for t in times})
+
+
+def extract_media(video: bytes, duration: float | None, with_audio: bool, n_spread: int = 6,
+                  n_end: int = 3) -> tuple[bytes | None, list[bytes]]:
+    """Extrait la bande-son (si demandée) et des images de bonne qualité de la vidéo."""
     if not shutil.which("ffmpeg"):
         return None, []
     tmp = tempfile.mkdtemp(prefix="carnet-av-")
@@ -137,21 +145,21 @@ def audio_and_frames(video: bytes, duration: float | None, n_frames: int = 8) ->
         with open(src, "wb") as fh:
             fh.write(video)
         t0 = time.time()
-        a = os.path.join(tmp, "a.mp3")
-        subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-i", src, "-vn", "-ac", "1", "-ar", "16000",
-                        "-b:a", "32k", "-t", "900", a], check=False, timeout=60)
-        if os.path.exists(a) and os.path.getsize(a) > 1000:
-            with open(a, "rb") as fh:
-                audio = fh.read()
-        dur = float(duration or 0) or 60.0
-        step = max(1.0, dur / (n_frames + 1))
-        subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-ss", f"{step / 2:.1f}", "-i", src,
-                        "-vf", f"fps=1/{step:.2f},scale=-2:540", "-frames:v", str(n_frames), "-q:v", "4",
-                        os.path.join(tmp, "f_%02d.jpg")], check=False, timeout=60)
-        for f in sorted(glob.glob(os.path.join(tmp, "f_*.jpg"))):
-            with open(f, "rb") as fh:
-                frames.append(fh.read())
-        log.info("Bande-son %s Ko + %s images extraites en %.1f s", len(audio or b"") // 1000, len(frames), time.time() - t0)
+        if with_audio:
+            a = os.path.join(tmp, "a.mp3")
+            subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-i", src, "-vn", "-ac", "1", "-ar", "16000",
+                            "-b:a", "32k", "-t", "900", a], check=False, timeout=60)
+            if os.path.exists(a) and os.path.getsize(a) > 1000:
+                with open(a, "rb") as fh:
+                    audio = fh.read()
+        for k, t in enumerate(frame_times(duration, n_spread, n_end)):
+            out = os.path.join(tmp, f"f_{k:02d}.jpg")
+            subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-ss", f"{t:.1f}", "-i", src,
+                            "-frames:v", "1", "-vf", "scale=-2:1280", "-q:v", "3", out], check=False, timeout=20)
+            if os.path.exists(out) and os.path.getsize(out) > 2000:
+                with open(out, "rb") as fh:
+                    frames.append(fh.read())
+        log.info("Extraction : son %s Ko, %s images en %.1f s", len(audio or b"") // 1000, len(frames), time.time() - t0)
     except (subprocess.SubprocessError, OSError) as e:
         log.info("Extraction son/images impossible : %s", e)
     finally:

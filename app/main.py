@@ -35,7 +35,7 @@ from PIL import Image, ImageOps
 
 from .free_import import OCR_AVAILABLE, ocr_image, parse_recipe_text
 VIDEO_MODE = os.getenv("GEMINI_VIDEO_MODE", "fast").strip().lower()   # fast = son + images, full = vidéo entière
-from .video_ai import GEMINI_API_KEY, GeminiError, audio_and_frames, gemini_generate, ytdlp_fetch
+from .video_ai import GEMINI_API_KEY, GeminiError, extract_media, gemini_generate, ytdlp_fetch
 
 log = logging.getLogger("carnet")
 logging.basicConfig(level=logging.INFO)
@@ -609,7 +609,7 @@ Règles :
 - "seasons" : parmi ["printemps","ete","automne","hiver"] selon la saisonnalité en France des ingrédients frais principaux ; tableau vide si la recette se cuisine toute l'année.
 - "category" : une valeur parmi {categories}.
 - "prepMin", "cookMin", "servings" : entiers, estime-les raisonnablement s'ils sont absents.
-- "coverImageIndex" : numéro de l'image qui montre le mieux le plat fini, ou null s'il n'y a pas d'image.
+- "coverImageIndex" : numéro de l'image qui montre le mieux le PLAT FINI, terminé et dressé (dans l'assiette, le plat ou la casserole), net et appétissant. Jamais une image d'ingrédients crus, de préparation en cours ou de texte. null s'il n'y a aucune image du plat fini.
 - "notes" : une phrase courte sur ce qui manquait ou a été déduit, ou "".
 - "tags" : 1 à 4 mots-clés courts en minuscules.
 
@@ -664,7 +664,7 @@ async def import_recipe(url: str = Form(""), caption: str = Form(""), source: st
         host = (urlparse(url).hostname or "").lower()
         if any(k in host for k in ("tiktok", "instagram", "youtu", "facebook", "fb.watch")):
             try:
-                yd = await asyncio.wait_for(asyncio.to_thread(ytdlp_fetch, url, bool(GEMINI_API_KEY), caption_needs_video), timeout=75)
+                yd = await asyncio.wait_for(asyncio.to_thread(ytdlp_fetch, url, bool(GEMINI_API_KEY)), timeout=75)
             except asyncio.TimeoutError:
                 log.info("yt-dlp abandonné après 75 s : %s", url)
                 yd = None
@@ -674,7 +674,7 @@ async def import_recipe(url: str = Form(""), caption: str = Form(""), source: st
                 video = yd["video"]
                 if yd["thumb_url"]:
                     info["thumb"] = await download_image(yd["thumb_url"])
-        need_video = bool(GEMINI_API_KEY) and not video and "tiktok" in host and caption_needs_video(info["caption"])
+        need_video = bool(GEMINI_API_KEY) and not video and "tiktok" in host
         if need_video or not (info["caption"] or info["thumb"] or video):
             try:
                 page = await asyncio.wait_for(fetch_link_info(url, want_video=need_video), timeout=40)
@@ -786,19 +786,21 @@ def jpeg_bytes(raw: bytes, max_side: int = 1600) -> bytes:
 
 
 async def gemini_import(info: dict, video: bytes | None, url: str, caption: str, shots: list[bytes], source: str) -> dict:
-    # 1. la description contient déjà la recette ? Gemini lit seulement le texte (quelques secondes)
+    # 1. la description contient déjà la recette : Gemini lit le texte + quelques images de fin (photo)
+    # 2. sinon : bande-son + images réparties, bien plus rapide que la vidéo entière
     audio, frames, mode = None, [], "texte"
     if video:
         pre = parse_recipe_text(info["caption"], caption, [], info["author"])
-        if len(pre["ingredients"]) >= 3 and len(pre["steps"]) >= 2:
-            log.info("Recette complète dans la description : analyse du texte seul")
-            video = None
-        elif VIDEO_MODE == "full":
+        complete = len(pre["ingredients"]) >= 3 and len(pre["steps"]) >= 2
+        if VIDEO_MODE == "full" and not complete:
             mode = "vidéo complète"
         else:
-            # 2. sinon : bande-son + quelques images, bien plus rapide que la vidéo entière
-            audio, frames = await asyncio.to_thread(audio_and_frames, video, info.get("duration"))
-            if audio or frames:
+            audio, frames = await asyncio.to_thread(
+                extract_media, video, info.get("duration"), not complete, 0 if complete else 6, 4 if complete else 3)
+            if complete:
+                log.info("Recette complète dans la description : texte + images de fin pour la photo")
+                video = None
+            elif audio or frames:
                 video, mode = None, "son + images"
             else:
                 mode = "vidéo complète"
@@ -806,7 +808,7 @@ async def gemini_import(info: dict, video: bytes | None, url: str, caption: str,
     imgs = []
     for raw in shots + frames + ([info["thumb"]] if send_thumb else []):
         try:
-            imgs.append(jpeg_bytes(raw))
+            imgs.append(jpeg_bytes(raw, 768))
         except Exception:  # noqa: BLE001
             pass
     if video:
@@ -816,8 +818,8 @@ async def gemini_import(info: dict, video: bytes | None, url: str, caption: str,
     else:
         lines = ["Pas de vidéo jointe."]
     lines += [f"Image {i} : capture d'écran envoyée par l'utilisateur." for i in range(len(shots))]
-    lines += [f"Image {len(shots) + i} : image extraite de la vidéo ({i + 1}/{len(frames)}, dans l'ordre chronologique)."
-              for i in range(len(frames))]
+    lines += [f"Image {len(shots) + i} : image extraite de la vidéo ({i + 1}/{len(frames)}, dans l'ordre chronologique"
+              f"{', vers la fin' if i >= len(frames) - 3 else ''})." for i in range(len(frames))]
     if send_thumb:
         lines.append(f"Image {len(shots)} : miniature de la vidéo.")
     prompt = IMPORT_PROMPT.format(
@@ -843,12 +845,18 @@ async def gemini_import(info: dict, video: bytes | None, url: str, caption: str,
     idx = res.get("coverImageIndex")
     photo = None
     try:
-        if info["thumb"]:
-            photo = {"id": save_image(info["thumb"])}
-        elif isinstance(idx, int) and 0 <= idx < len(shots):
+        n = len(shots)
+        if isinstance(idx, int) and n <= idx < n + len(frames):
+            photo = {"id": save_image(frames[idx - n])}                 # plat fini choisi par Gemini
+        elif isinstance(idx, int) and 0 <= idx < n:
             photo = {"id": save_image(crop_video_frame(shots[idx]))}
+        elif frames:
+            photo = {"id": save_image(frames[-1])}                      # fin de vidéo = plat dressé, en général
+        elif info["thumb"]:
+            photo = {"id": save_image(info["thumb"])}
         elif shots:
             photo = {"id": save_image(crop_video_frame(shots[0]))}
+        log.info("Photo de la fiche : image %s choisie par Gemini", idx)
     except HTTPException:
         photo = None
     res["sourceUrl"] = info["url"] or url or source
