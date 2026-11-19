@@ -15,6 +15,7 @@ import re
 import shutil
 import subprocess
 import tempfile
+import time
 
 import httpx
 
@@ -27,6 +28,7 @@ GEMINI_MODELS = [m.strip() for m in os.getenv(
     "GEMINI_MODEL",
     "gemini-3.8-flash,gemini-3.6-flash,gemini-3.5-flash,gemini-3-flash-preview,gemini-2.5-flash,gemini-flash-latest",
 ).split(",") if m.strip()]
+GEMINI_THINKING = os.getenv("GEMINI_THINKING", "low").strip().lower()   # low = réponse rapide
 MAX_INLINE_VIDEO = 14 * 1024 * 1024   # la requête complète doit rester sous 20 Mo
 _working_model: str | None = None
 
@@ -40,11 +42,13 @@ def ytdlp_fetch(url: str, download: bool) -> dict:
 
     out = {"caption": "", "author": "", "thumb_url": "", "video": None, "url": url, "duration": None}
     tmp = tempfile.mkdtemp(prefix="carnet-")
+    t0 = time.time()
     opts = {
         "quiet": True, "no_warnings": True, "noplaylist": True,
         "socket_timeout": 15, "source_address": "0.0.0.0", "retries": 1,
         "outtmpl": os.path.join(tmp, "video.%(ext)s"),
-        "format": "b[height<=720]/bv*[height<=720]+ba/b/bv*+ba/w",
+        # 480p suffit pour lire le texte à l'écran : téléchargement et envoi plus rapides
+        "format": "b[height<=480]/bv*[height<=480]+ba/b[height<=720]/bv*[height<=720]+ba/w/b",
         "merge_output_format": "mp4",
         "max_filesize": 40 * 1024 * 1024,
         "skip_download": not download,
@@ -70,7 +74,7 @@ def ytdlp_fetch(url: str, download: bool) -> dict:
                     out["video"] = data
                 else:
                     log.info("Vidéo trop lourde pour Gemini (%s Mo) : on utilise la description", len(data) // 1_000_000)
-        log.info("yt-dlp %s : description %s car., vidéo %s", url, len(out["caption"]),
+        log.info("yt-dlp %s en %.1f s : description %s car., vidéo %s", url, time.time() - t0, len(out["caption"]),
                  f"{len(out['video']) // 1000} Ko" if out["video"] else "non")
     except Exception as e:  # noqa: BLE001
         log.info("yt-dlp %s : échec (%s)", url, str(e)[:200])
@@ -136,27 +140,40 @@ async def gemini_generate(prompt: str, video: bytes | None, images: list[bytes])
     for img in images:
         parts.append({"inline_data": {"mime_type": "image/jpeg", "data": base64.b64encode(img).decode()}})
     parts.append({"text": prompt})
-    body = {
-        "contents": [{"role": "user", "parts": parts}],
-        "generationConfig": {"temperature": 0.2, "responseMimeType": "application/json", "maxOutputTokens": 4096},
-    }
+    def make_body(fast: bool) -> dict:
+        cfg = {"temperature": 0.2, "responseMimeType": "application/json", "maxOutputTokens": 4096}
+        if fast:
+            cfg["mediaResolution"] = "MEDIA_RESOLUTION_LOW"        # ~4x moins de calcul par image
+            if GEMINI_THINKING in ("low", "minimal", "none", "0"):
+                cfg["thinkingConfig"] = {"thinkingLevel": "low"}    # pas de longue « réflexion »
+        return {"contents": [{"role": "user", "parts": parts}], "generationConfig": cfg}
+
     models = ([_working_model] if _working_model else []) + [m for m in GEMINI_MODELS if m != _working_model]
     last = "aucun modèle disponible"
     async with httpx.AsyncClient(timeout=httpx.Timeout(150.0, connect=10.0),
                                  transport=httpx.AsyncHTTPTransport(local_address="0.0.0.0")) as c:
         for model in models:
-            try:
-                r = await c.post(f"{GEMINI_BASE_URL}/v1beta/models/{model}:generateContent",
-                                 headers={"x-goog-api-key": GEMINI_API_KEY, "content-type": "application/json"},
-                                 json=body)
-            except httpx.HTTPError as e:
-                raise GeminiError("Impossible de joindre Gemini. Réessaie dans un instant.") from e
-            log.info("Gemini %s : HTTP %s", model, r.status_code)
+            fast = True
+            for _attempt in range(2):
+                t0 = time.time()
+                try:
+                    r = await c.post(f"{GEMINI_BASE_URL}/v1beta/models/{model}:generateContent",
+                                     headers={"x-goog-api-key": GEMINI_API_KEY, "content-type": "application/json"},
+                                     json=make_body(fast))
+                except httpx.HTTPError as e:
+                    raise GeminiError("Impossible de joindre Gemini. Réessaie dans un instant.") from e
+                log.info("Gemini %s : HTTP %s en %.1f s%s", model, r.status_code, time.time() - t0,
+                         " (mode rapide)" if fast else "")
+                # le modèle refuse un réglage de vitesse : on réessaie sans
+                if fast and r.status_code == 400 and re.search(r"thinking|media.?resolution|unknown name|invalid json", r.text, re.I):
+                    log.info("Gemini %s : réglages rapides refusés, nouvel essai sans", model)
+                    fast = False
+                    continue
+                break
             if r.status_code in (404, 400) and ("not found" in r.text.lower() or "not supported" in r.text.lower()):
                 last = f"modèle {model} indisponible"
                 continue
             if r.status_code == 429:
-                # quota du modèle épuisé (ou nul en gratuit) : on tente le suivant
                 last = "quota gratuit atteint"
                 log.info("Gemini %s : %s", model, r.text[:300])
                 continue

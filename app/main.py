@@ -745,14 +745,15 @@ def jpeg_bytes(raw: bytes, max_side: int = 1600) -> bytes:
 
 async def gemini_import(info: dict, video: bytes | None, url: str, caption: str, shots: list[bytes], source: str) -> dict:
     imgs = []
-    for raw in shots + ([info["thumb"]] if info["thumb"] else []):
+    send_thumb = info["thumb"] and not video          # avec la vidéo, la miniature n'apporte rien
+    for raw in shots + ([info["thumb"]] if send_thumb else []):
         try:
             imgs.append(jpeg_bytes(raw))
         except Exception:  # noqa: BLE001
             pass
     lines = ["Une vidéo est jointe (avec le son)." if video else "Pas de vidéo jointe."]
     lines += [f"Image {i} : capture d'écran envoyée par l'utilisateur." for i in range(len(shots))]
-    if info["thumb"]:
+    if send_thumb:
         lines.append(f"Image {len(shots)} : miniature de la vidéo.")
     prompt = IMPORT_PROMPT.format(
         images_desc="\n".join(lines), categories=json.dumps(CATEGORIES, ensure_ascii=False),
