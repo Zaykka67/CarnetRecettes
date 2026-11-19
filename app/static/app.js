@@ -173,7 +173,7 @@ function render(){
   if(!loaded){ g.innerHTML='<div class="skel"></div>'.repeat(6); return; }
   const list=filtered();
   if(!n){
-    g.innerHTML=`<div class="empty" style="grid-column:1/-1"><h2>Ton carnet est vide</h2><p>Partage une vidéo TikTok vers l'appli, ou ajoute ta première recette à la main.</p><div class="actions">${cfg.ai?`<button class="btn primary" type="button" data-act="import">${ICON.spark} Importer depuis une vidéo</button>`:''}<button class="btn" type="button" data-act="manual">${ICON.pen} Saisir à la main</button></div></div>`;
+    g.innerHTML=`<div class="empty" style="grid-column:1/-1"><h2>Ton carnet est vide</h2><p>Partage une vidéo TikTok vers l'appli, ou ajoute ta première recette à la main.</p><div class="actions"><button class="btn primary" type="button" data-act="import">${ICON.spark} Importer depuis une vidéo</button><button class="btn" type="button" data-act="manual">${ICON.pen} Saisir à la main</button></div></div>`;
     return;
   }
   if(!list.length){
@@ -379,7 +379,7 @@ function renderImporter(){
       <form class="f" id="import-form" novalidate>
         <div class="field"><label for="i-url">Lien de la vidéo ou de la page</label>
           <input class="input" id="i-url" type="url" inputmode="url" placeholder="https://vm.tiktok.com/…" value="${esc(imp.url)}" ${imp.busy?'disabled':''}>
-          <p class="hint">TikTok, Instagram, YouTube ou un site de cuisine. L'appli lit la description et la miniature de la vidéo, puis Claude rédige la fiche.</p></div>
+          <p class="hint">TikTok, Instagram, YouTube ou un site de cuisine. L'appli lit la description et la miniature de la vidéo${cfg.ai?', puis Claude rédige la fiche':' et range les ingrédients et les étapes'}.</p></div>
         <details class="more" ${openMore?'open':''}>
           <summary>La recette n'est que dite à l'oral ? Ajoute du texte ou des captures</summary>
           <div class="inner">
@@ -388,12 +388,12 @@ function renderImporter(){
               <div class="drop" id="i-drop">
                 ${imp.files.length?`<div class="shots">${imp.urls.map((u,k)=>`<div class="shot"><img src="${esc(u)}" alt="Capture ${k+1}"><button type="button" data-rmshot="${k}" aria-label="Retirer la capture ${k+1}">✕</button></div>`).join('')}</div>`:''}
                 ${imp.files.length<MAX_SHOTS && !imp.busy?`<span class="btn filebtn">${ICON.img} Ajouter des captures<input type="file" accept="image/*" multiple id="i-shots" aria-label="Ajouter des captures"></span>`:''}
-                <p class="hint">Fais des captures des étapes et du plat fini : Claude les lit et choisit la plus belle comme photo.</p>
+                <p class="hint">${cfg.ai?'Fais des captures des étapes et du plat fini : Claude les lit et choisit la plus belle comme photo.':'Fais des captures où la liste des ingrédients ou les étapes sont écrites : l\'appli lit le texte. La dernière capture sert de photo si la vidéo n\'a pas de miniature.'}</p>
               </div></div>
           </div>
         </details>
         ${imp.error?`<div class="callout warn">${esc(imp.error)}</div>`:''}
-        ${imp.busy?`<div class="working"><span class="spinner"></span><span style="flex:1">Lecture de la vidéo et rédaction de la fiche… jusqu'à une minute.</span><button class="btn" type="button" data-act="stop-import">Arrêter</button></div>`:
+        ${imp.busy?`<div class="working"><span class="spinner"></span><span style="flex:1">${cfg.ai?"Lecture de la vidéo et rédaction de la fiche… jusqu'à une minute.":'Lecture de la vidéo…'}</span><button class="btn" type="button" data-act="stop-import">Arrêter</button></div>`:
         `<div class="formbar">
           <button class="btn" type="button" data-act="import-manual">Saisir moi-même</button>
           <button class="btn primary" type="submit">${ICON.spark} Créer la fiche</button>
@@ -419,14 +419,13 @@ async function runImport(){
   const url=imp.url.trim(), caption=imp.caption.trim();
   if(url && !safeUrl(url)){ imp.error="Ce lien ne semble pas valide : il doit commencer par https://"; renderImporter(); return; }
   if(!url && !caption && !imp.files.length){ imp.error="Colle un lien, du texte ou ajoute au moins une capture d'écran."; renderImporter(); return; }
-  if(!cfg.ai){ imp.error="L'import automatique n'est pas configuré sur le serveur (clé API manquante). Tu peux saisir la recette toi-même."; renderImporter(); return; }
   imp.busy=true; imp.error=''; imp.ctl=new AbortController(); renderImporter();
   try{
     const fd=new FormData(); fd.append('url',url); fd.append('caption',caption);
     for(const f of imp.files){ fd.append('images', await resizeImage(f,1600,.85), 'capture.jpg'); }
     const res=await api('/api/import',{method:'POST', body:fd, signal:imp.ctl.signal});
     if(!imp) return;
-    const notice = "Fiche rédigée par Claude : relis-la avant d'enregistrer." + (res.notes? ' '+res.notes : '');
+    const notice = res.ai===false ? (res.notes || "Fiche pré-remplie : relis-la avant d'enregistrer.") : "Fiche rédigée par Claude : relis-la avant d'enregistrer." + (res.notes? ' '+res.notes : '');
     imp.busy=false;
     openEditor({...blankDraft(), ...res.draft}, {notice});
   }catch(e){
@@ -445,7 +444,7 @@ function handleShare(){
   const m=all.match(/https?:\/\/[^\s"'<>]+/);
   history.replaceState(null,'','/');
   if(!m){ if(all.trim()) openImporter({caption:all.trim()}); return; }
-  openImporter({url:m[0], autoStart:cfg.ai});
+  openImporter({url:m[0], autoStart:true});
 }
 
 /* ---------- Dialogues ---------- */
@@ -453,7 +452,7 @@ function openDialog(html){ $('#dlg-box').innerHTML=html; $('#dlg').hidden=false;
 function closeDialog(){ $('#dlg').hidden=true; $('#dlg-box').innerHTML=''; }
 function openAddMenu(){
   openDialog(`<h3>Ajouter une recette</h3>
-    <button class="menu-opt" type="button" data-act="import">${ICON.spark}<div><b>Depuis une vidéo ou un lien</b><span>TikTok, Instagram, YouTube, site de cuisine : Claude rédige la fiche.</span></div></button>
+    <button class="menu-opt" type="button" data-act="import">${ICON.spark}<div><b>Depuis une vidéo ou un lien</b><span>TikTok, Instagram, YouTube, site de cuisine : la fiche se pré-remplit toute seule.</span></div></button>
     <button class="menu-opt" type="button" data-act="manual">${ICON.pen}<div><b>À la main</b><span>Tu saisis toi-même les ingrédients et les étapes.</span></div></button>
     <div class="formbar"><button class="btn" type="button" data-act="close-dlg">Fermer</button></div>`);
 }

@@ -33,6 +33,8 @@ from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from PIL import Image, ImageOps
 
+from .free_import import OCR_AVAILABLE, ocr_image, parse_recipe_text
+
 log = logging.getLogger("carnet")
 logging.basicConfig(level=logging.INFO)
 
@@ -64,7 +66,8 @@ UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
 if not APP_PASSWORD:
     log.warning("APP_PASSWORD n'est pas défini : l'appli est accessible sans mot de passe.")
 if not ANTHROPIC_API_KEY:
-    log.warning("ANTHROPIC_API_KEY n'est pas défini : l'import automatique est désactivé.")
+    log.info("ANTHROPIC_API_KEY absent : import gratuit (lecture de la description + OCR %s).",
+             "actif" if OCR_AVAILABLE else "indisponible")
 
 # --------------------------------------------------------------------------
 # Base de données
@@ -221,7 +224,7 @@ async def auth_mw(request: Request, call_next):
 
 @app.get("/api/config")
 async def config(request: Request):
-    return {"ai": bool(ANTHROPIC_API_KEY), "auth": bool(APP_PASSWORD), "loggedIn": is_authed(request)}
+    return {"ai": bool(ANTHROPIC_API_KEY), "ocr": OCR_AVAILABLE, "auth": bool(APP_PASSWORD), "loggedIn": is_authed(request)}
 
 
 @app.post("/api/login")
@@ -480,8 +483,6 @@ def parse_json_reply(text: str) -> dict:
 @app.post("/api/import")
 async def import_recipe(url: str = Form(""), caption: str = Form(""),
                         images: list[UploadFile] | None = File(None)):
-    if not ANTHROPIC_API_KEY:
-        raise HTTPException(503, "L'import automatique n'est pas configuré (clé API Anthropic manquante).")
     url = url.strip()
     shots: list[bytes] = []
     for f in (images or [])[:MAX_SHOTS]:
@@ -494,6 +495,9 @@ async def import_recipe(url: str = Form(""), caption: str = Form(""),
 
     if not (info["caption"].strip() or caption.strip() or all_imgs):
         raise HTTPException(422, "Je n'ai rien pu lire depuis ce lien. Colle la description de la vidéo ou ajoute des captures d'écran.")
+
+    if not ANTHROPIC_API_KEY:
+        return free_import(info, url, caption, shots)
 
     lines = []
     for i in range(len(shots)):
@@ -553,6 +557,29 @@ async def import_recipe(url: str = Form(""), caption: str = Form(""),
     draft["favorite"] = False
     return {"draft": draft, "notes": _s(res.get("notes"), 400),
             "captionFound": bool(info["caption"].strip()), "platform": info["platform"]}
+
+
+def free_import(info: dict, url: str, caption: str, shots: list[bytes]) -> dict:
+    """Import sans IA : on découpe la légende et le texte lu sur les captures."""
+    ocr_text = "\n".join(t for t in (ocr_image(raw) for raw in shots) if t)
+    res = parse_recipe_text(info["caption"], caption, ocr_text, info["author"])
+    cover = info["thumb"] or (shots[-1] if shots else None)
+    photo = None
+    if cover:
+        try:
+            photo = {"id": save_image(cover)}
+        except HTTPException:
+            photo = None
+    notes = res.pop("notes")
+    if info["platform"] and not info["caption"] and not caption and not ocr_text:
+        notes = (f"Je n'ai pas pu lire la description sur {info['platform']}. "
+                 "Colle-la dans « Texte en plus » ou ajoute des captures d'écran.")
+    res["sourceUrl"] = info["url"] or url
+    res["photo"] = photo
+    draft = clean_recipe(res)
+    draft["favorite"] = False
+    return {"draft": draft, "notes": notes, "captionFound": bool(info["caption"].strip()),
+            "platform": info["platform"], "ai": False}
 
 
 # --------------------------------------------------------------------------
