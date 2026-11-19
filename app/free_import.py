@@ -75,8 +75,31 @@ def normalize(text: str) -> str:
     text = re.sub(r"(?m)^\s*[-–—*]\s+", "", text)      # puce en début de ligne
     text = re.sub(r"(?:^|\s)(\d{1,2})\s*[).]\s+(?=[A-Za-zÀ-ÿ])", r"\n\1. ", text)  # « 1) Mélanger »
     text = text.replace("\r", "")
-    lines = [re.sub(r"[ \t]+", " ", ln).strip(" .,;:-–—*|[]{}_~") for ln in text.split("\n")]
-    return "\n".join(ln for ln in lines if ln)
+    lines = [re.sub(r"[ \t]+", " ", ln).strip(" .,;:-–—*|[]{}_~<>\\/") for ln in text.split("\n")]
+    return "\n".join(ln for ln in lines if ln and not _is_garbage(ln))
+
+
+GENERIC_H = re.compile(r"\b[H#](recette\w*|fyp\w*|pourtoi\w*|food\w*|cuisine\w*|viral\w*)\b", re.I)
+
+
+def _is_garbage(ln: str) -> bool:
+    """Ligne de bruit OCR : peu de lettres, mots trop courts, ou hashtags mal lus."""
+    if GENERIC_H.search(ln) and len(GENERIC_H.sub("", ln).strip()) < 25:
+        return True
+    letters = len(re.findall(r"[A-Za-zÀ-ÿ]", ln))
+    words = re.findall(r"[A-Za-zÀ-ÿ']+", ln)
+    if re.match(r"^(\d+(?:\s*[.,/-]\s*\d+)?|[½¼¾])\s*[a-zA-Zà-ÿ]", ln):   # « 2 c. à s. de sauce » : ingrédient
+        return letters < 3
+    if letters < 4 or letters / max(1, len(ln.replace(" ", ""))) < 0.6:
+        return True
+    if len(words) >= 3 and sum(1 for w in words if len(w) <= 2) / len(words) > 0.6:
+        return True
+    if len(words) <= 3 and all(len(w) <= 2 or w.isupper() for w in words) and len(ln) < 12:
+        return True
+    # mots sans voyelle ou casse aléatoire (« mnrinA tamatzs ») : texte incrusté mal lu
+    weird = sum(1 for w in words if len(w) >= 4 and (not re.search(r"[aeiouyàâéèêëîïôûœ]", w, re.I)
+                                                      or re.search(r"[a-zà-ÿ][A-Z]", w)))
+    return len(words) >= 3 and weird / len(words) > 0.3
 
 
 def _strip_accents(s: str) -> str:
@@ -181,7 +204,9 @@ ING_HEAD = re.compile(r"^(ingr[ée]dients?|il (?:te|vous|nous) faut|liste|pour l
 STEP_HEAD = re.compile(r"^(pr[ée]paration|[ée]tapes?|instructions?|m[ée]thode|d[ée]roul[ée]|r[ée]alisation|"
                        r"la recette|recette)\b\s*[:\-]?\s*", re.I)
 META = re.compile(r"^(temps de )?(cuisson|pr[ée]paration|repos)\s*:?\s*\d+\s*(min|mn|h)\b[^.]{0,20}$", re.I)
-NOISE = re.compile(r"(abonne|follow|like|partage|commente|enregistre|lien en bio|link in bio|code promo|"
+NOISE = re.compile(r"(abonne|follow|like|partage|commente|commentaire|enregistre|lien en bio|link in bio|code promo|"
+                   r"il y a \d+|voir la traduction|r[ée]pondre|r[ée]ponses?\b|j'aime|ajoutez|ajouter un|"
+                   r"son original|original sound|\bvues\b|\bvues?\s*$|tiktok|instagram|"
                    r"sponsoris|collab|pub\b|ad\b|dis[- ]moi|tague|mentionne|n'h[ée]site|merci)", re.I)
 
 

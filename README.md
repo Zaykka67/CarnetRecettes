@@ -20,6 +20,8 @@ carnet-recettes/
 |---|---|
 | `APP_PASSWORD` | Mot de passe demandé à l'ouverture. **Obligatoire en ligne**, sinon n'importe qui peut lire ton carnet et consommer ta clé API. |
 | `SECRET_KEY` | Longue chaîne aléatoire qui signe la session (tu restes connecté 1 an). Génère-la avec `openssl rand -hex 32`. |
+| `GEMINI_API_KEY` | **Recommandé, gratuit.** Clé de l'IA Gemini de Google (aistudio.google.com → Get API key). Gemini regarde la vidéo avec le son, lit les captures et rédige la fiche. |
+| `GEMINI_MODEL` | Facultatif. Liste de modèles à essayer, séparés par des virgules. Par défaut, l'appli essaie les modèles Flash récents et garde le premier qui répond. |
 | `ANTHROPIC_API_KEY` | Clé de l'API Claude, créée sur console.anthropic.com. Sans elle, l'appli marche mais sans import automatique. |
 | `ANTHROPIC_MODEL` | Modèle utilisé, `claude-sonnet-5-5` par défaut. |
 | `DATA_DIR` | Dossier des données, `/data` dans le conteneur. |
@@ -60,6 +62,10 @@ Sauvegarde : tout tient dans le volume `/data` (`recettes.db` et le dossier `pho
 Dans TikTok : Partager → Plus → « Ajouter au Carnet ». La page s'ouvre dans Safari (connecte-toi une fois dans Safari aussi, la session de l'icône d'accueil est séparée).
 
 ## Comment marche l'import
+
+- **Avec `GEMINI_API_KEY`** : le serveur télécharge la vidéo (yt-dlp), la réduit si besoin (ffmpeg) et l'envoie à Gemini avec la description et les captures. Gemini écoute ce qui est dit et lit le texte à l'écran. Sur l'offre gratuite, Google peut utiliser les contenus envoyés pour améliorer ses produits.
+- **Sans clé** : la description est découpée automatiquement et le texte des captures est lu par Tesseract (OCR). Moins fiable : relis toujours la fiche.
+
 
 - **TikTok / YouTube** : le serveur récupère la légende et la miniature via l'oEmbed officiel (sans compte ni clé).
 - **Sites de cuisine** : il lit la description de la page et, s'il y en a, les données de recette structurées (schema.org).

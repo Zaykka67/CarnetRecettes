@@ -377,7 +377,7 @@ function renderImporter(){
   const linkPane=`
       <div class="field"><label for="i-url">Lien de la vidéo ou de la page</label>
         <input class="input" id="i-url" type="url" inputmode="url" placeholder="https://vm.tiktok.com/…" value="${esc(imp.url)}" ${dis}>
-        <p class="hint">TikTok, YouTube, Instagram ou un site de cuisine. L'appli lit la description et la miniature de la vidéo${cfg.ai?', puis Claude rédige la fiche':''}.</p></div>`;
+        <p class="hint">TikTok, YouTube, Instagram ou un site de cuisine. ${cfg.provider==='gemini'?"Gemini regarde la vidéo, écoute ce qui est dit et rédige la fiche.":cfg.ai?"L'appli lit la description et la miniature, puis Claude rédige la fiche.":"L'appli lit la description et la miniature de la vidéo et range les ingrédients et les étapes."}</p></div>`;
   const shotsPane=`
       <div class="field"><span class="lab">Captures d'écran (${imp.files.length}/${MAX_SHOTS})</span>
         <div class="drop" id="i-drop">
@@ -387,7 +387,9 @@ function renderImporter(){
         </div></div>
       <div class="field"><label for="i-cap">Ou colle le texte de la recette</label><textarea class="input" id="i-cap" rows="5" placeholder="Copie la description de la vidéo et colle-la ici…" ${dis}>${esc(imp.caption)}</textarea></div>
       <div class="field"><label for="i-src">Lien de la vidéo (facultatif, pour la retrouver)</label><input class="input" id="i-src" type="url" inputmode="url" placeholder="https://vm.tiktok.com/…" value="${esc(imp.url)}" ${dis}></div>`;
-  const busyLabel = link ? 'Lecture de la vidéo…' : (imp.files.length? 'Lecture des captures…' : 'Analyse du texte…');
+  const who = cfg.provider==='gemini' ? 'Gemini' : 'Claude';
+  const busyLabel = link ? (cfg.provider==='gemini' ? 'Gemini regarde la vidéo…' : cfg.ai ? 'Lecture de la vidéo…' : 'Lecture de la vidéo…')
+                         : (cfg.ai ? `${who} lit ${imp.files.length?'les captures':'le texte'}…` : (imp.files.length? 'Lecture des captures…' : 'Analyse du texte…'));
   s.innerHTML=`<div class="sheet-bar">
       <button class="btn ghost" type="button" data-act="close-importer">Annuler</button>
       <span class="ttl">Importer une recette</span><span style="width:70px"></span>
@@ -430,7 +432,7 @@ async function runImport(){
   imp.busy=true; imp.error=''; imp.timedOut=false; imp.ctl=ctl; imp.started=Date.now(); renderImporter();
   clearInterval(imp.tick);
   imp.tick=setInterval(()=>{ const el=$('#i-elapsed'); if(el && imp) el.textContent=Math.round((Date.now()-imp.started)/1000)+' s'; },1000);
-  const limit = link ? 45000 : 90000;
+  const limit = cfg.ai ? 150000 : (link ? 45000 : 90000);
   const timer=setTimeout(()=>{ if(imp && imp.ctl===ctl){ imp.timedOut=true; ctl.abort(); } }, limit);
   try{
     const fd=new FormData();
@@ -443,7 +445,7 @@ async function runImport(){
     const res=await api('/api/import',{method:'POST', body:fd, signal:ctl.signal});
     if(!imp || imp.ctl!==ctl) return;
     clearInterval(imp.tick);
-    const notice = res.ai===false ? (res.notes || "Fiche pré-remplie : relis-la avant d'enregistrer.") : "Fiche rédigée par Claude : relis-la avant d'enregistrer." + (res.notes? ' '+res.notes : '');
+    const notice = res.ai===false ? (res.notes || "Fiche pré-remplie : relis-la avant d'enregistrer.") : `Fiche rédigée par ${res.provider==='gemini'?'Gemini':'Claude'}${res.video?" à partir de la vidéo":''} : relis-la avant d'enregistrer.` + (res.notes? ' '+res.notes : '');
     imp.busy=false;
     const draft={...blankDraft(), ...res.draft};
     closeImporter();                 // l'éditeur ne doit pas s'ouvrir derrière l'écran d'import

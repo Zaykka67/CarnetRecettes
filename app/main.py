@@ -34,6 +34,7 @@ from fastapi.staticfiles import StaticFiles
 from PIL import Image, ImageOps
 
 from .free_import import OCR_AVAILABLE, ocr_image, parse_recipe_text
+from .video_ai import GEMINI_API_KEY, GeminiError, gemini_generate, ytdlp_fetch
 
 log = logging.getLogger("carnet")
 logging.basicConfig(level=logging.INFO)
@@ -65,7 +66,9 @@ UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
 
 if not APP_PASSWORD:
     log.warning("APP_PASSWORD n'est pas défini : l'appli est accessible sans mot de passe.")
-if not ANTHROPIC_API_KEY:
+if GEMINI_API_KEY:
+    log.info("GEMINI_API_KEY présent : import par Gemini (vidéo + son + captures).")
+elif not ANTHROPIC_API_KEY:
     log.info("ANTHROPIC_API_KEY absent : import gratuit (lecture de la description + OCR %s).",
              "actif" if OCR_AVAILABLE else "indisponible")
 
@@ -248,7 +251,8 @@ async def auth_mw(request: Request, call_next):
 
 @app.get("/api/config")
 async def config(request: Request):
-    return {"ai": bool(ANTHROPIC_API_KEY), "ocr": OCR_AVAILABLE, "auth": bool(APP_PASSWORD), "loggedIn": is_authed(request)}
+    provider = "gemini" if GEMINI_API_KEY else ("claude" if ANTHROPIC_API_KEY else "")
+    return {"ai": bool(provider), "provider": provider, "ocr": OCR_AVAILABLE, "auth": bool(APP_PASSWORD), "loggedIn": is_authed(request)}
 
 
 @app.post("/api/login")
@@ -565,6 +569,8 @@ IMPORT_PROMPT = """Tu aides à remplir un carnet de recettes personnel, en fran�
 {images_desc}
 
 Règles :
+- Si une vidéo est jointe, regarde-la ET écoute-la : les ingrédients, quantités et étapes peuvent être dits à l'oral ou écrits à l'écran. Croise avec la légende.
+- Sur les captures d'écran, ignore l'interface de l'appli (boutons, « Ajoutez un commentaire », likes, dates, hashtags) : ne garde que la recette.
 - N'invente pas de quantité absente : mets "qty": null. Une quantité lisible dans le texte ou sur une image doit être reprise.
 - "qty" est un nombre (0.5 pour un demi). "unit" est court : g, kg, ml, cl, l, c. à s., c. à c., pincée, gousse, tranche, sachet, botte… ou "" pour une pièce (ex. 3 œufs).
 - "name" est l'ingrédient seul, sans "de" au début.
@@ -622,20 +628,37 @@ async def import_recipe(url: str = Form(""), caption: str = Form(""), source: st
             shots.append(raw)
 
     empty = {"caption": "", "author": "", "thumb": None, "platform": "", "url": url}
-    info = empty
+    info, video = empty, None
     if url:
         t0 = time.time()
-        try:
-            info = await asyncio.wait_for(fetch_link_info(url), timeout=30)
-        except asyncio.TimeoutError:
-            log.info("Lecture du lien abandonnée après 30 s : %s", url)
-            info = {**empty, "platform": _platform(urlparse(url).hostname or "")}
-        log.info("Lecture du lien en %.1f s (légende %s, miniature %s)", time.time() - t0,
-                 "oui" if info["caption"] else "non", "oui" if info["thumb"] else "non")
+        host = (urlparse(url).hostname or "").lower()
+        if any(k in host for k in ("tiktok", "instagram", "youtu", "facebook", "fb.watch")):
+            try:
+                yd = await asyncio.wait_for(asyncio.to_thread(ytdlp_fetch, url, bool(GEMINI_API_KEY)), timeout=75)
+            except asyncio.TimeoutError:
+                log.info("yt-dlp abandonné après 75 s : %s", url)
+                yd = None
+            if yd and (yd["caption"] or yd["thumb_url"] or yd["video"]):
+                info = {"caption": yd["caption"], "author": yd["author"], "thumb": None,
+                        "platform": _platform(host), "url": yd["url"] or url}
+                video = yd["video"]
+                if yd["thumb_url"]:
+                    info["thumb"] = await download_image(yd["thumb_url"])
+        if not (info["caption"] or info["thumb"] or video):
+            try:
+                info = await asyncio.wait_for(fetch_link_info(url), timeout=30)
+            except asyncio.TimeoutError:
+                log.info("Lecture du lien abandonnée après 30 s : %s", url)
+                info = {**empty, "platform": _platform(host)}
+        log.info("Lecture du lien en %.1f s (légende %s, miniature %s, vidéo %s)", time.time() - t0,
+                 "oui" if info["caption"] else "non", "oui" if info["thumb"] else "non", "oui" if video else "non")
     all_imgs = shots + ([info["thumb"]] if info["thumb"] else [])
 
-    if not (info["caption"].strip() or caption.strip() or all_imgs):
+    if not (info["caption"].strip() or caption.strip() or all_imgs or video):
         raise HTTPException(422, "Je n'ai rien pu lire depuis ce lien. Colle la description de la vidéo ou ajoute des captures d'écran.")
+
+    if GEMINI_API_KEY:
+        return await gemini_import(info, video, url, caption, shots, source)
 
     if not ANTHROPIC_API_KEY:
         return await free_import(info, url, caption, shots, source)
@@ -698,6 +721,76 @@ async def import_recipe(url: str = Form(""), caption: str = Form(""), source: st
     draft["favorite"] = False
     return {"draft": draft, "notes": _s(res.get("notes"), 400),
             "captionFound": bool(info["caption"].strip()), "platform": info["platform"]}
+
+
+async def download_image(img_url: str) -> bytes | None:
+    if not re.match(r"^https?://", img_url or ""):
+        return None
+    try:
+        async with httpx.AsyncClient(follow_redirects=True, timeout=httpx.Timeout(10.0, connect=5.0),
+                                     transport=httpx.AsyncHTTPTransport(local_address="0.0.0.0"),
+                                     headers={"User-Agent": UA}) as c:
+            return await _get_limited(c, img_url, 8_000_000)
+    except httpx.HTTPError:
+        return None
+
+
+def jpeg_bytes(raw: bytes, max_side: int = 1600) -> bytes:
+    img = ImageOps.exif_transpose(Image.open(io.BytesIO(raw))).convert("RGB")
+    img.thumbnail((max_side, max_side))
+    buf = io.BytesIO()
+    img.save(buf, "JPEG", quality=85)
+    return buf.getvalue()
+
+
+async def gemini_import(info: dict, video: bytes | None, url: str, caption: str, shots: list[bytes], source: str) -> dict:
+    imgs = []
+    for raw in shots + ([info["thumb"]] if info["thumb"] else []):
+        try:
+            imgs.append(jpeg_bytes(raw))
+        except Exception:  # noqa: BLE001
+            pass
+    lines = ["Une vidéo est jointe (avec le son)." if video else "Pas de vidéo jointe."]
+    lines += [f"Image {i} : capture d'écran envoyée par l'utilisateur." for i in range(len(shots))]
+    if info["thumb"]:
+        lines.append(f"Image {len(shots)} : miniature de la vidéo.")
+    prompt = IMPORT_PROMPT.format(
+        images_desc="\n".join(lines), categories=json.dumps(CATEGORIES, ensure_ascii=False),
+        url=info["url"] or url or source or "(aucun)", author=info["author"] or "(inconnu)",
+        caption=(info["caption"] or "(rien trouvé)")[:20000], user_text=(caption or "(rien)")[:12000])
+    t0 = time.time()
+    try:
+        res = await gemini_generate(prompt, video, imgs)
+    except GeminiError as e:
+        log.info("Gemini indisponible (%s) : import sans IA", e)
+        out = await free_import(info, url, caption, shots, source)
+        out["notes"] = f"{e} Fiche pré-remplie sans IA : vérifie-la bien."
+        return out
+    log.info("Gemini a répondu en %.1f s", time.time() - t0)
+    if not isinstance(res, dict) or res.get("error"):
+        if shots or caption or info["caption"]:
+            out = await free_import(info, url, caption, shots, source)
+            out["notes"] = "Gemini n'a pas trouvé de recette claire : fiche pré-remplie sans IA, vérifie-la."
+            return out
+        raise HTTPException(422, f"Pas de recette trouvée : {res.get('error') if isinstance(res, dict) else 'réponse vide'}")
+    idx = res.get("coverImageIndex")
+    photo = None
+    try:
+        if info["thumb"]:
+            photo = {"id": save_image(info["thumb"])}
+        elif isinstance(idx, int) and 0 <= idx < len(shots):
+            photo = {"id": save_image(crop_video_frame(shots[idx]))}
+        elif shots:
+            photo = {"id": save_image(crop_video_frame(shots[0]))}
+    except HTTPException:
+        photo = None
+    res["sourceUrl"] = info["url"] or url or source
+    res["photo"] = photo
+    draft = clean_recipe(res)
+    draft["favorite"] = False
+    return {"draft": draft, "notes": _s(res.get("notes"), 400), "platform": info["platform"],
+            "captionFound": bool(info["caption"].strip()), "ai": True, "provider": "gemini",
+            "video": bool(video)}
 
 
 async def free_import(info: dict, url: str, caption: str, shots: list[bytes], source: str = "") -> dict:
