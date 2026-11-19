@@ -34,7 +34,8 @@ from fastapi.staticfiles import StaticFiles
 from PIL import Image, ImageOps
 
 from .free_import import OCR_AVAILABLE, ocr_image, parse_recipe_text
-from .video_ai import GEMINI_API_KEY, GeminiError, gemini_generate, ytdlp_fetch
+VIDEO_MODE = os.getenv("GEMINI_VIDEO_MODE", "fast").strip().lower()   # fast = son + images, full = vidéo entière
+from .video_ai import GEMINI_API_KEY, GeminiError, audio_and_frames, gemini_generate, ytdlp_fetch
 
 log = logging.getLogger("carnet")
 logging.basicConfig(level=logging.INFO)
@@ -663,17 +664,17 @@ async def import_recipe(url: str = Form(""), caption: str = Form(""), source: st
         host = (urlparse(url).hostname or "").lower()
         if any(k in host for k in ("tiktok", "instagram", "youtu", "facebook", "fb.watch")):
             try:
-                yd = await asyncio.wait_for(asyncio.to_thread(ytdlp_fetch, url, bool(GEMINI_API_KEY)), timeout=75)
+                yd = await asyncio.wait_for(asyncio.to_thread(ytdlp_fetch, url, bool(GEMINI_API_KEY), caption_needs_video), timeout=75)
             except asyncio.TimeoutError:
                 log.info("yt-dlp abandonné après 75 s : %s", url)
                 yd = None
             if yd and (yd["caption"] or yd["thumb_url"] or yd["video"]):
                 info = {"caption": yd["caption"], "author": yd["author"], "thumb": None,
-                        "platform": _platform(host), "url": yd["url"] or url}
+                        "platform": _platform(host), "url": yd["url"] or url, "duration": yd.get("duration")}
                 video = yd["video"]
                 if yd["thumb_url"]:
                     info["thumb"] = await download_image(yd["thumb_url"])
-        need_video = bool(GEMINI_API_KEY) and not video and "tiktok" in host
+        need_video = bool(GEMINI_API_KEY) and not video and "tiktok" in host and caption_needs_video(info["caption"])
         if need_video or not (info["caption"] or info["thumb"] or video):
             try:
                 page = await asyncio.wait_for(fetch_link_info(url, want_video=need_video), timeout=40)
@@ -758,6 +759,12 @@ async def import_recipe(url: str = Form(""), caption: str = Form(""), source: st
             "captionFound": bool(info["caption"].strip()), "platform": info["platform"]}
 
 
+def caption_needs_video(text: str) -> bool:
+    """Faut-il regarder la vidéo, ou la description contient-elle déjà la recette ?"""
+    pre = parse_recipe_text(text, "", [], "")
+    return not (len(pre["ingredients"]) >= 3 and len(pre["steps"]) >= 2)
+
+
 async def download_image(img_url: str) -> bytes | None:
     if not re.match(r"^https?://", img_url or ""):
         return None
@@ -779,24 +786,48 @@ def jpeg_bytes(raw: bytes, max_side: int = 1600) -> bytes:
 
 
 async def gemini_import(info: dict, video: bytes | None, url: str, caption: str, shots: list[bytes], source: str) -> dict:
+    # 1. la description contient déjà la recette ? Gemini lit seulement le texte (quelques secondes)
+    audio, frames, mode = None, [], "texte"
+    if video:
+        pre = parse_recipe_text(info["caption"], caption, [], info["author"])
+        if len(pre["ingredients"]) >= 3 and len(pre["steps"]) >= 2:
+            log.info("Recette complète dans la description : analyse du texte seul")
+            video = None
+        elif VIDEO_MODE == "full":
+            mode = "vidéo complète"
+        else:
+            # 2. sinon : bande-son + quelques images, bien plus rapide que la vidéo entière
+            audio, frames = await asyncio.to_thread(audio_and_frames, video, info.get("duration"))
+            if audio or frames:
+                video, mode = None, "son + images"
+            else:
+                mode = "vidéo complète"
+    send_thumb = info["thumb"] and not video and not frames
     imgs = []
-    send_thumb = info["thumb"] and not video          # avec la vidéo, la miniature n'apporte rien
-    for raw in shots + ([info["thumb"]] if send_thumb else []):
+    for raw in shots + frames + ([info["thumb"]] if send_thumb else []):
         try:
             imgs.append(jpeg_bytes(raw))
         except Exception:  # noqa: BLE001
             pass
-    lines = ["Une vidéo est jointe (avec le son)." if video else "Pas de vidéo jointe."]
+    if video:
+        lines = ["Une vidéo est jointe (avec le son)."]
+    elif audio:
+        lines = ["La bande-son de la vidéo est jointe : écoute ce qui est dit (ingrédients, quantités, étapes)."]
+    else:
+        lines = ["Pas de vidéo jointe."]
     lines += [f"Image {i} : capture d'écran envoyée par l'utilisateur." for i in range(len(shots))]
+    lines += [f"Image {len(shots) + i} : image extraite de la vidéo ({i + 1}/{len(frames)}, dans l'ordre chronologique)."
+              for i in range(len(frames))]
     if send_thumb:
         lines.append(f"Image {len(shots)} : miniature de la vidéo.")
     prompt = IMPORT_PROMPT.format(
         images_desc="\n".join(lines), categories=json.dumps(CATEGORIES, ensure_ascii=False),
         url=info["url"] or url or source or "(aucun)", author=info["author"] or "(inconnu)",
         caption=(info["caption"] or "(rien trouvé)")[:20000], user_text=(caption or "(rien)")[:12000])
+    log.info("Gemini : envoi en mode %s", mode)
     t0 = time.time()
     try:
-        res = await gemini_generate(prompt, video, imgs)
+        res = await gemini_generate(prompt, video, imgs, audio)
     except GeminiError as e:
         log.info("Gemini indisponible (%s) : import sans IA", e)
         out = await free_import(info, url, caption, shots, source)
@@ -826,7 +857,7 @@ async def gemini_import(info: dict, video: bytes | None, url: str, caption: str,
     draft["favorite"] = False
     return {"draft": draft, "notes": _s(res.get("notes"), 400), "platform": info["platform"],
             "captionFound": bool(info["caption"].strip()), "ai": True, "provider": "gemini",
-            "video": bool(video)}
+            "video": mode != "texte"}
 
 
 async def free_import(info: dict, url: str, caption: str, shots: list[bytes], source: str = "") -> dict:

@@ -37,7 +37,7 @@ _working_model: str | None = None
 # --------------------------------------------------------------------------
 # yt-dlp
 # --------------------------------------------------------------------------
-def ytdlp_fetch(url: str, download: bool) -> dict:
+def ytdlp_fetch(url: str, download: bool, need_video=None) -> dict:
     """À lancer dans un thread. Renvoie description, auteur, miniature et, si demandé, la vidéo."""
     import yt_dlp
 
@@ -45,7 +45,7 @@ def ytdlp_fetch(url: str, download: bool) -> dict:
     tmp = tempfile.mkdtemp(prefix="carnet-")
     t0 = time.time()
     opts = {
-        "quiet": True, "no_warnings": True, "noplaylist": True,
+        "quiet": True, "no_warnings": True, "noplaylist": True, "noprogress": True,
         "socket_timeout": 15, "source_address": "0.0.0.0", "retries": 1,
         "outtmpl": os.path.join(tmp, "video.%(ext)s"),
         # 480p suffit pour lire le texte à l'écran : téléchargement et envoi plus rapides
@@ -64,6 +64,10 @@ def ytdlp_fetch(url: str, download: bool) -> dict:
             info = y.extract_info(url, download=False)
             if info.get("_type") == "playlist" and info.get("entries"):
                 info = next(e for e in info["entries"] if e)
+            caption = (info.get("description") or info.get("title") or "").strip()
+            if download and need_video is not None and not need_video(caption):
+                log.info("yt-dlp : recette déjà dans la description, vidéo non téléchargée")
+                download = False
             if download:
                 try:   # si la vidéo échoue, on garde quand même la description et la miniature
                     y.process_ie_result(info, download=True)
@@ -121,6 +125,48 @@ def shrink_video(path: str, tmp: str) -> bytes | None:
         return None
 
 
+def audio_and_frames(video: bytes, duration: float | None, n_frames: int = 8) -> tuple[bytes | None, list[bytes]]:
+    """Extrait la bande-son (mono, 32 kb/s) et quelques images de la vidéo.
+    Bien plus rapide à analyser pour Gemini que la vidéo complète."""
+    if not shutil.which("ffmpeg"):
+        return None, []
+    tmp = tempfile.mkdtemp(prefix="carnet-av-")
+    src = os.path.join(tmp, "v.mp4")
+    audio, frames = None, []
+    try:
+        with open(src, "wb") as fh:
+            fh.write(video)
+        t0 = time.time()
+        a = os.path.join(tmp, "a.mp3")
+        subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-i", src, "-vn", "-ac", "1", "-ar", "16000",
+                        "-b:a", "32k", "-t", "900", a], check=False, timeout=60)
+        if os.path.exists(a) and os.path.getsize(a) > 1000:
+            with open(a, "rb") as fh:
+                audio = fh.read()
+        dur = float(duration or 0) or 60.0
+        step = max(1.0, dur / (n_frames + 1))
+        subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-ss", f"{step / 2:.1f}", "-i", src,
+                        "-vf", f"fps=1/{step:.2f},scale=-2:540", "-frames:v", str(n_frames), "-q:v", "4",
+                        os.path.join(tmp, "f_%02d.jpg")], check=False, timeout=60)
+        for f in sorted(glob.glob(os.path.join(tmp, "f_*.jpg"))):
+            with open(f, "rb") as fh:
+                frames.append(fh.read())
+        log.info("Bande-son %s Ko + %s images extraites en %.1f s", len(audio or b"") // 1000, len(frames), time.time() - t0)
+    except (subprocess.SubprocessError, OSError) as e:
+        log.info("Extraction son/images impossible : %s", e)
+    finally:
+        for f in glob.glob(os.path.join(tmp, "*")):
+            try:
+                os.remove(f)
+            except OSError:
+                pass
+        try:
+            os.rmdir(tmp)
+        except OSError:
+            pass
+    return audio, frames
+
+
 # --------------------------------------------------------------------------
 # Gemini
 # --------------------------------------------------------------------------
@@ -142,12 +188,14 @@ def _parse_json(text: str) -> dict:
         raise
 
 
-async def gemini_generate(prompt: str, video: bytes | None, images: list[bytes]) -> dict:
+async def gemini_generate(prompt: str, video: bytes | None, images: list[bytes], audio: bytes | None = None) -> dict:
     """Envoie vidéo + images + consigne à Gemini et renvoie le JSON de la fiche."""
     global _working_model
     parts: list[dict] = []
     if video:
         parts.append({"inline_data": {"mime_type": "video/mp4", "data": base64.b64encode(video).decode()}})
+    if audio:
+        parts.append({"inline_data": {"mime_type": "audio/mp3", "data": base64.b64encode(audio).decode()}})
     for img in images:
         parts.append({"inline_data": {"mime_type": "image/jpeg", "data": base64.b64encode(img).decode()}})
     parts.append({"text": prompt})
