@@ -325,11 +325,12 @@ async def get_photo(pid: str):
 
 
 # ---- Import depuis un lien ------------------------------------------------------
-def _public_host(host: str) -> bool:
-    """Refuse les adresses internes (localhost, réseau privé…)."""
+async def _public_host(host: str) -> bool:
+    """Refuse les adresses internes (localhost, réseau privé…). Résolution asynchrone, 5 s maximum."""
     try:
-        infos = socket.getaddrinfo(host, None)
-    except socket.gaierror:
+        loop = asyncio.get_running_loop()
+        infos = await asyncio.wait_for(loop.getaddrinfo(host, None, family=socket.AF_INET), timeout=5)
+    except (OSError, asyncio.TimeoutError):
         return False
     for info in infos:
         ip = ipaddress.ip_address(info[4][0])
@@ -359,7 +360,7 @@ def _meta(html: str, prop: str) -> str:
 async def _get_limited(client: httpx.AsyncClient, url: str, limit: int) -> bytes | None:
     """Télécharge au plus `limit` octets, uniquement depuis une adresse publique."""
     host = urlparse(url).hostname or ""
-    if not host or not _public_host(host):
+    if not host or not await _public_host(host):
         return None
     async with client.stream("GET", url) as r:
         if r.status_code >= 400:
@@ -589,6 +590,7 @@ def parse_json_reply(text: str) -> dict:
 async def import_recipe(url: str = Form(""), caption: str = Form(""),
                         images: list[UploadFile] | None = File(None)):
     url = url.strip()
+    log.info("Import demandé : lien=%s, texte=%s car., captures=%s", url or "-", len(caption), len(images or []))
     shots: list[bytes] = []
     for f in (images or [])[:MAX_SHOTS]:
         raw = await f.read(MAX_UPLOAD + 1)
@@ -612,7 +614,7 @@ async def import_recipe(url: str = Form(""), caption: str = Form(""),
         raise HTTPException(422, "Je n'ai rien pu lire depuis ce lien. Colle la description de la vidéo ou ajoute des captures d'écran.")
 
     if not ANTHROPIC_API_KEY:
-        return free_import(info, url, caption, shots)
+        return await free_import(info, url, caption, shots)
 
     lines = []
     for i in range(len(shots)):
@@ -674,9 +676,13 @@ async def import_recipe(url: str = Form(""), caption: str = Form(""),
             "captionFound": bool(info["caption"].strip()), "platform": info["platform"]}
 
 
-def free_import(info: dict, url: str, caption: str, shots: list[bytes]) -> dict:
+async def free_import(info: dict, url: str, caption: str, shots: list[bytes]) -> dict:
     """Import sans IA : on découpe la légende et le texte lu sur les captures."""
-    ocr_text = "\n".join(t for t in (ocr_image(raw) for raw in shots) if t)
+    t0 = time.time()
+    texts = await asyncio.gather(*(asyncio.to_thread(ocr_image, raw) for raw in shots))
+    ocr_text = "\n".join(t for t in texts if t)
+    if shots:
+        log.info("OCR de %s capture(s) en %.1f s : %s caractères lus", len(shots), time.time() - t0, len(ocr_text))
     res = parse_recipe_text(info["caption"], caption, ocr_text, info["author"])
     cover = info["thumb"] or (shots[-1] if shots else None)
     photo = None

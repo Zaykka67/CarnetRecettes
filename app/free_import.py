@@ -339,6 +339,13 @@ def parse_recipe_text(caption: str, extra: str = "", ocr: str = "", author: str 
         split_steps.extend(x for x in re.split(r"(?<=[.!?])\s+(?=[A-ZÀ-Ý])", st) if x.strip())
     steps = [re.sub(r"^\d{1,2}\.\s*", "", s).strip(" .") for s in split_steps]
     steps = [s[0].upper() + s[1:] for s in steps if len(s) > 2]
+    seen_steps, uniq_steps = set(), []
+    for st in steps:
+        k = _strip_accents(st)[:40]
+        if k not in seen_steps:
+            seen_steps.add(k)
+            uniq_steps.append(st)
+    steps = uniq_steps
     ings = [parse_ingredient(i) for i in ingredients if len(i) > 1]
     # dédoublonnage (OCR + légende peuvent répéter)
     seen, uniq = set(), []
