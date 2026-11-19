@@ -377,6 +377,84 @@ def _text(raw: bytes | None) -> str:
     return raw.decode("utf-8", errors="replace") if raw else ""
 
 
+def _tiktok_from_html(html: str) -> dict:
+    """Lit la légende et la miniature dans le HTML d'une page TikTok."""
+    res = {"caption": "", "author": "", "thumb_url": ""}
+    m = re.search(r'<script[^>]+id="__UNIVERSAL_DATA_FOR_REHYDRATION__"[^>]*>(.*?)</script>', html, re.S)
+    if m:
+        try:
+            data = json.loads(m.group(1))
+            item = data["__DEFAULT_SCOPE__"]["webapp.video-detail"]["itemInfo"]["itemStruct"]
+            res["caption"] = item.get("desc", "") or ""
+            res["author"] = (item.get("author") or {}).get("uniqueId", "")
+            video = item.get("video") or {}
+            res["thumb_url"] = video.get("originCover") or video.get("cover") or video.get("dynamicCover") or ""
+            if not res["thumb_url"]:
+                imgs = ((item.get("imagePost") or {}).get("images") or [])
+                if imgs:
+                    res["thumb_url"] = (imgs[0].get("imageURL") or {}).get("urlList", [""])[0]
+        except (ValueError, KeyError, TypeError, IndexError):
+            pass
+    if not res["caption"]:
+        res["caption"] = _meta(html, "og:description") or _meta(html, "description")
+    if not res["thumb_url"]:
+        res["thumb_url"] = _meta(html, "og:image")
+    return res
+
+
+async def tiktok_info(c: httpx.AsyncClient, url: str, out: dict) -> str:
+    """Récupère légende, auteur et miniature d'une vidéo TikTok. Renvoie l'URL de la miniature."""
+
+    async def oembed(u: str) -> dict | None:
+        try:
+            r = await c.get("https://www.tiktok.com/oembed", params={"url": u})
+        except httpx.HTTPError as e:
+            log.info("TikTok oEmbed %s : erreur réseau %s", u, e)
+            return None
+        log.info("TikTok oEmbed %s : HTTP %s", u, r.status_code)
+        if r.status_code == 200:
+            try:
+                j = r.json()
+            except ValueError:
+                return None
+            if j.get("title") or j.get("thumbnail_url"):
+                return j
+        return None
+
+    # 1. oEmbed directement avec le lien partagé
+    j = await oembed(url)
+    html = ""
+    if not j:
+        # 2. on suit le lien court jusqu'à la vraie page de la vidéo
+        try:
+            r = await c.get(url)
+            final = str(r.url)
+            html = r.text if r.status_code < 400 else ""
+            log.info("TikTok lien %s -> %s (HTTP %s, %s octets)", url, final.split("?")[0], r.status_code, len(r.content))
+        except httpx.HTTPError as e:
+            final = url
+            log.info("TikTok lien %s : erreur réseau %s", url, e)
+        m = re.search(r"tiktok\.com/@([\w.\-]+)/(?:video|photo)/(\d+)", final)
+        if m:
+            out["url"] = f"https://www.tiktok.com/@{m.group(1)}/video/{m.group(2)}"
+            j = await oembed(out["url"])
+        elif final != url:
+            out["url"] = final.split("?")[0]
+            j = await oembed(out["url"])
+    if j:
+        out["caption"], out["author"] = j.get("title", "") or "", j.get("author_name", "") or ""
+        return j.get("thumbnail_url", "") or ""
+    # 3. dernier recours : lire la page elle-même
+    if html:
+        res = _tiktok_from_html(html)
+        log.info("TikTok page : légende %s, miniature %s", "trouvée" if res["caption"] else "absente",
+                 "trouvée" if res["thumb_url"] else "absente")
+        out["caption"], out["author"] = res["caption"], res["author"]
+        return res["thumb_url"]
+    log.info("TikTok : rien de lisible pour %s", url)
+    return ""
+
+
 async def fetch_link_info(url: str) -> dict:
     """Récupère la légende, l'auteur et la miniature d'une vidéo ou d'une page."""
     out = {"caption": "", "author": "", "thumb": None, "platform": "", "url": url}
@@ -385,19 +463,10 @@ async def fetch_link_info(url: str) -> dict:
     async with httpx.AsyncClient(follow_redirects=True, timeout=15, headers={"User-Agent": UA, "Accept-Language": "fr-FR,fr;q=0.9"}) as c:
         try:
             host = (urlparse(url).hostname or "").lower()
-            # Liens courts TikTok (vm.tiktok.com, /t/...) : on suit la redirection
-            if "tiktok" in host and ("vm." in host or "vt." in host or "/t/" in url):
-                r = await c.get(url)
-                url = str(r.url).split("?")[0]
-                out["url"] = url
-                host = (urlparse(url).hostname or "").lower()
             out["platform"] = _platform(host)
             thumb_url = ""
             if "tiktok" in host:
-                r = await c.get("https://www.tiktok.com/oembed", params={"url": url})
-                if r.status_code == 200:
-                    j = r.json()
-                    out["caption"], out["author"], thumb_url = j.get("title", ""), j.get("author_name", ""), j.get("thumbnail_url", "")
+                thumb_url = await tiktok_info(c, url, out)
             elif "youtu" in host:
                 r = await c.get("https://www.youtube.com/oembed", params={"url": url, "format": "json"})
                 if r.status_code == 200:
