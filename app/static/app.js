@@ -89,7 +89,7 @@ function cleanStep(s){ return s.replace(/^\s*(?:\d+[.)-]|[-•*·]|étape\s*\d+\
 
 let toastT;
 function toast(msg){ const t=$('#toast'); t.textContent=msg; t.hidden=false; clearTimeout(toastT); toastT=setTimeout(()=>t.hidden=true, 3200); }
-function lockScroll(){ document.body.style.overflow = ($('#detail').hidden && $('#editor').hidden && $('#importer').hidden && $('#shopping').hidden) ? '' : 'hidden'; }
+function lockScroll(){ document.body.style.overflow = ($('#detail').hidden && $('#editor').hidden && $('#importer').hidden && $('#shopping').hidden && $('#menu').hidden) ? '' : 'hidden'; }
 
 async function resizeImage(file, max=1600, q=.85){
   let bmp; try{ bmp=await createImageBitmap(file,{imageOrientation:'from-image'}); }catch{ bmp=await createImageBitmap(file); }
@@ -168,18 +168,18 @@ function openShopPicker(){
 function renderShopPicker(){
   const n=pick.items.filter(i=>i.on).length;
   openDialog(`<h3>Ajouter aux courses</h3>
-    <p>${esc(pick.title)}${pick.servings?` · pour ${pick.servings} personne${pick.servings>1?'s':''}`:''}. Décoche ce que tu as déjà.</p>
+    <p>${esc(pick.title)}${pick.servings?` · pour ${pick.servings} personne${pick.servings>1?'s':''}`:''}. Décoche ce que tu as déjà${pick.multi?' (les ingrédients communs seront additionnés)':''}.</p>
     <div class="pick-tools"><button type="button" data-act="pick-all">Tout cocher</button><button type="button" data-act="pick-none">Tout décocher</button></div>
-    <ul class="pick-list">${pick.items.map((i,k)=>{const d=shopLine(i); return `<li data-pick-ing="${k}" class="${i.on?'on':''}"><span class="check"></span><span class="txt">${d.q?`<span class="q">${esc(d.q)}</span> `:''}${esc(d.t)}</span></li>`;}).join('')}</ul>
+    <ul class="pick-list">${pick.items.map((i,k)=>{const d=shopLine(i); return `<li data-pick-ing="${k}" class="${i.on?'on':''}"><span class="check"></span><span class="txt">${d.q?`<span class="q">${esc(d.q)}</span> `:''}${esc(d.t)}${pick.multi&&i.recipe?`<span class="from">${esc(i.recipe)}</span>`:''}</span></li>`;}).join('')}</ul>
     <div class="formbar"><button class="btn" type="button" data-act="close-dlg">Annuler</button><button class="btn primary" type="button" data-act="pick-confirm" ${n?'':'disabled'}>Ajouter ${n} article${n>1?'s':''}</button></div>`);
   $('#dlg-box').classList.add('wide');
 }
 async function confirmShopPicker(){
-  const items=pick.items.filter(i=>i.on).map(({name,qty,unit})=>({name,qty,unit}));
+  const items=pick.items.filter(i=>i.on).map(({name,qty,unit,recipe})=>({name,qty,unit,recipe}));
   const btn=$('[data-act=pick-confirm]'); if(btn){ btn.disabled=true; btn.textContent='Ajout…'; }
   try{
     setShop(await api('/api/shopping/add', jsonOpts('POST',{recipeTitle:pick.title, items})));
-    closeDialog(); toast(`${items.length} article${items.length>1?'s':''} ajouté${items.length>1?'s':''} à la liste de courses`);
+    closeDialog(); toast(pick.multi ? `Ingrédients de la semaine ajoutés à la liste de courses` : `${items.length} article${items.length>1?'s':''} ajouté${items.length>1?'s':''} à la liste de courses`);
   }catch(e){ if(btn){ btn.disabled=false; btn.textContent='Réessayer'; } toast(e.message); }
 }
 
@@ -213,6 +213,128 @@ function renderShopping(){
 function shopText(){
   const groups={}; shop.filter(i=>!i.checked).forEach(i=>{ (groups[i.aisle]=groups[i.aisle]||[]).push(i); });
   return 'Liste de courses\n'+Object.entries(groups).map(([a,items])=>'\n'+a+'\n'+items.map(i=>{const d=shopLine(i); return '- '+(d.q?d.q+' ':'')+d.t;}).join('\n')).join('\n');
+}
+
+/* ---------- Menus de la semaine ---------- */
+const DAYS=['Lundi','Mardi','Mercredi','Jeudi','Vendredi','Samedi','Dimanche'];
+const DAYS_S=['Lun','Mar','Mer','Jeu','Ven','Sam','Dim'];
+const MEAL_LABEL={midi:'Midi', soir:'Soir'};
+const pad=n=>String(n).padStart(2,'0');
+const isoDay=d=>`${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}`;
+const addDays=(d,n)=>{ const x=new Date(d); x.setDate(x.getDate()+n); return x; };
+function mondayOf(d){ const x=new Date(d.getFullYear(),d.getMonth(),d.getDate()); x.setDate(x.getDate()-((x.getDay()+6)%7)); return x; }
+function weekLabel(start){
+  const end=addDays(start,6), m1=MONTHS[start.getMonth()], m2=MONTHS[end.getMonth()];
+  return start.getMonth()===end.getMonth() ? `Du ${start.getDate()} au ${end.getDate()} ${m2}` : `Du ${start.getDate()} ${m1} au ${end.getDate()} ${m2}`;
+}
+let week={start:mondayOf(new Date()), entries:[], loading:false};
+async function loadWeek(){
+  const start=isoDay(week.start), end=isoDay(addDays(week.start,6));
+  week.loading=true;
+  try{ week.entries=await api(`/api/menu?start=${start}&end=${end}`); }
+  catch(e){ if(e.status!==401) toast(e.message); }
+  week.loading=false; if(!$('#menu').hidden) renderMenu();
+}
+function openMenu(){ const s=$('#menu'); renderMenu(); s.hidden=false; s.scrollTop=0; lockScroll(); loadWeek(); }
+function closeMenu(){ $('#menu').hidden=true; lockScroll(); }
+function thumbHTML(r){ const src=photoSrc(r); return `<span class="th">${src?`<img src="${esc(src)}" alt="" loading="lazy">`:placeholder(r)}</span>`; }
+function entryHTML(e){
+  if(!e.recipeId) return `<div class="entry free"><span class="nm">${esc(e.text)}</span><button class="rm" type="button" data-menu-rm="${esc(e.id)}" aria-label="Retirer">✕</button></div>`;
+  const r=recipes.find(x=>x.id===e.recipeId);
+  if(!r) return `<div class="entry free"><span class="nm">Recette supprimée</span><button class="rm" type="button" data-menu-rm="${esc(e.id)}" aria-label="Retirer">✕</button></div>`;
+  return `<div class="entry" data-menu-open="${esc(r.id)}" data-menu-serv="${esc(e.servings||'')}">${thumbHTML(r)}<span class="nm">${esc(r.title)}${e.servings?`<small>${e.servings} pers.</small>`:''}</span><button class="rm" type="button" data-menu-rm="${esc(e.id)}" aria-label="Retirer">✕</button></div>`;
+}
+function renderMenu(){
+  const s=$('#menu'), today=isoDay(new Date()), isThis=isoDay(week.start)===isoDay(mondayOf(new Date()));
+  const nRecipes=week.entries.filter(e=>e.recipeId && recipes.find(r=>r.id===e.recipeId)).length;
+  s.innerHTML=`<div class="sheet-bar">
+      <button class="btn ghost" type="button" data-act="close-menu">${ICON.back} Carnet</button>
+      <span class="ttl">Menus de la semaine</span><span style="width:70px"></span>
+    </div>
+    <div class="sheet-inner">
+      <div class="week-nav">
+        <div><h2>Menus</h2><div class="sub">${esc(weekLabel(week.start))}${isThis?' · cette semaine':''}</div></div>
+        <div class="arrows">
+          <button class="iconbtn" type="button" data-act="week-prev" aria-label="Semaine précédente">${ICON.back}</button>
+          ${isThis?'':`<button class="btn" type="button" data-act="week-now">Cette semaine</button>`}
+          <button class="iconbtn" type="button" data-act="week-next" aria-label="Semaine suivante" style="transform:scaleX(-1)">${ICON.back}</button>
+        </div>
+      </div>
+      <div class="week-tools">
+        ${nRecipes?`<button class="btn primary" type="button" data-act="week-shop"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 4h2l2.4 11.2a2 2 0 0 0 2 1.6h7.7a2 2 0 0 0 2-1.5L21 8H6"/><circle cx="10" cy="20.5" r="1.3"/><circle cx="17" cy="20.5" r="1.3"/></svg> Ajouter la semaine aux courses</button>`:''}
+      </div>
+      <div class="week">
+        ${DAYS.map((name,i)=>{ const d=addDays(week.start,i), iso=isoDay(d);
+          return `<div class="day ${iso===today?'today':''}">
+            <div class="day-h"><b>${DAYS_S[i]}</b><span>${d.getDate()}</span></div>
+            ${['midi','soir'].map(m=>`<div class="slot"><span class="slot-l">${MEAL_LABEL[m]}</span>
+              ${week.entries.filter(e=>e.day===iso && e.meal===m).map(entryHTML).join('')}
+              <button class="slot-add" type="button" data-slot="${iso}|${m}" aria-label="Ajouter au ${MEAL_LABEL[m].toLowerCase()} du ${name.toLowerCase()} ${d.getDate()}">+ Ajouter</button>
+            </div>`).join('')}
+          </div>`; }).join('')}
+      </div>
+    </div>`;
+}
+
+/* Ajouter un repas depuis une case : recette ou texte libre */
+let slotPick=null; // {day, meal, tab, q}
+function openSlotPicker(day, meal){ slotPick={day, meal, tab: recipes.length?'recipe':'free', q:''}; renderSlotPicker(); }
+function renderSlotPicker(){
+  const d=new Date(slotPick.day+'T12:00:00'), label=`${DAYS[(d.getDay()+6)%7]} ${d.getDate()} · ${MEAL_LABEL[slotPick.meal]}`;
+  const q=slotPick.q.trim().toLowerCase();
+  const list=recipes.filter(r=>!q || (r.title||'').toLowerCase().includes(q))
+    .sort((a,b)=>((b.seasons||[]).includes(NOW_SEASON)-(a.seasons||[]).includes(NOW_SEASON)) || (b.favorite-a.favorite) || a.title.localeCompare(b.title));
+  openDialog(`<h3>${esc(label)}</h3>
+    <div class="seg" role="tablist"><button type="button" data-slot-tab="recipe" aria-pressed="${slotPick.tab==='recipe'}">Une recette</button><button type="button" data-slot-tab="free" aria-pressed="${slotPick.tab==='free'}">Texte libre</button></div>
+    ${slotPick.tab==='recipe'?`
+      <label class="search" for="slot-q"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg><input id="slot-q" type="search" placeholder="Chercher une recette…" value="${esc(slotPick.q)}" autocomplete="off"></label>
+      ${list.length?`<ul class="rpick">${list.map(r=>`<li data-slot-recipe="${esc(r.id)}">${thumbHTML(r)}<span class="nm">${esc(r.title)}<small>${[totalTime(r), r.servings?r.servings+' pers.':'', (r.seasons||[]).includes(NOW_SEASON)?'de saison':''].filter(Boolean).join(' · ')}</small></span></li>`).join('')}</ul>`:`<p>Aucune recette ne correspond.</p>`}
+      <div class="formbar"><button class="btn" type="button" data-act="close-dlg">Fermer</button></div>`
+    :`<form id="slot-free-form" novalidate style="display:grid;gap:12px">
+        <label for="slot-free" style="position:absolute;left:-9999px">Ce que tu manges</label>
+        <input class="input" id="slot-free" placeholder="Restes, resto, pizza…" maxlength="120" autocomplete="off">
+        <div class="formbar"><button class="btn" type="button" data-act="close-dlg">Annuler</button><button class="btn primary" type="submit">Ajouter</button></div>
+      </form>`}`);
+  $('#dlg-box').classList.add('wide');
+  setTimeout(()=>{ const el=$('#slot-q')||$('#slot-free'); if(el){ el.focus(); if(el.id==='slot-q') el.setSelectionRange(el.value.length, el.value.length); } },30);
+}
+async function addMenuEntry(body){
+  try{ await api('/api/menu', jsonOpts('POST', body)); await loadWeek(); return true; }
+  catch(e){ toast(e.message); return false; }
+}
+
+/* Ajouter au menu depuis une recette */
+let planPick=null; // {recipeId, start, day, meal, servings}
+function openPlanPicker(){
+  const r=recipes.find(x=>x.id===det.id); if(!r) return;
+  const now=new Date(), start=mondayOf(now);
+  planPick={recipeId:r.id, title:r.title, start, day:isoDay(now), meal: now.getHours()<14?'midi':'soir', servings: det.servings||+r.servings||null};
+  renderPlanPicker();
+}
+function renderPlanPicker(){
+  const p=planPick;
+  openDialog(`<h3>Ajouter au menu</h3><p>${esc(p.title)}</p>
+    <div class="row-between"><span class="lab" style="font-size:.8rem;font-weight:600;color:var(--muted);text-transform:uppercase;letter-spacing:.06em">Jour</span>
+      <div class="mini-nav"><button type="button" data-act="plan-prev" aria-label="Semaine précédente">‹</button><span>${esc(weekLabel(p.start))}</span><button type="button" data-act="plan-next" aria-label="Semaine suivante">›</button></div></div>
+    <div class="chips-days">${DAYS_S.map((n,i)=>{ const d=addDays(p.start,i), iso=isoDay(d); return `<button type="button" data-plan-day="${iso}" aria-pressed="${p.day===iso}">${n}<b>${d.getDate()}</b></button>`; }).join('')}</div>
+    <div class="meal-pick"><button type="button" data-plan-meal="midi" aria-pressed="${p.meal==='midi'}">Midi</button><button type="button" data-plan-meal="soir" aria-pressed="${p.meal==='soir'}">Soir</button></div>
+    ${p.servings?`<div class="row-between"><span>Personnes</span><div class="stepper"><button type="button" data-act="plan-serv-" aria-label="Moins">−</button><span class="v" style="font-weight:650">${p.servings}</span><button type="button" data-act="plan-serv+" aria-label="Plus">+</button></div></div>`:''}
+    <div class="formbar"><button class="btn" type="button" data-act="close-dlg">Annuler</button><button class="btn primary" type="button" data-act="plan-confirm">Ajouter au menu</button></div>`);
+}
+
+/* Toute la semaine vers la liste de courses */
+function openWeekShopPicker(){
+  const items=[];
+  week.entries.forEach(e=>{
+    const r=e.recipeId && recipes.find(x=>x.id===e.recipeId); if(!r) return;
+    const base=+r.servings||0, factor= base && e.servings ? e.servings/base : 1;
+    (r.ingredients||[]).forEach(i=>items.push({name:i.name, unit:i.unit||'', recipe:r.title,
+      qty: i.qty!=null && i.qty!=='' ? Math.round(i.qty*factor*100)/100 : null,
+      on: !PANTRY.includes((i.name||'').trim().toLowerCase())}));
+  });
+  if(!items.length){ toast("Aucune recette avec des ingrédients cette semaine."); return; }
+  pick={title:'Menus — '+weekLabel(week.start).toLowerCase(), servings:null, multi:true, items};
+  renderShopPicker();
 }
 
 /* ---------- Connexion ---------- */
@@ -344,6 +466,7 @@ function renderDetail(){
       ${(r.tags||[]).length?`<div class="tags">${r.tags.map(t=>`<span class="tag">#${esc(t)}</span>`).join('')}</div>`:''}
       ${url?`<p class="source">${ICON.link} Recette vue sur ${esc(plat)} : <a href="${esc(url)}" target="_blank" rel="noopener noreferrer">voir la vidéo d'origine</a></p>`:''}
       <div class="r-actions">
+        <button class="btn" type="button" data-act="add-plan"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="5" width="18" height="16" rx="3"/><path d="M3 10h18M8 3v4M16 3v4"/></svg> Ajouter au menu</button>
         <button class="btn" type="button" data-act="edit">${ICON.pen} Modifier</button>
         <button class="btn danger" type="button" data-act="delete">${ICON.trash} Supprimer</button>
       </div>
@@ -580,7 +703,7 @@ function openAddMenu(){
 
 /* ---------- Événements ---------- */
 document.addEventListener('click', async ev=>{
-  const t=ev.target.closest('[data-act],[data-season],[data-cat],[data-fav],[data-open],[data-ing],[data-step],[data-pick],[data-rmshot],[data-tab],[data-pick-ing],[data-shop],[data-shop-rm]');
+  const t=ev.target.closest('[data-act],[data-season],[data-cat],[data-fav],[data-open],[data-ing],[data-step],[data-pick],[data-rmshot],[data-tab],[data-pick-ing],[data-shop],[data-shop-rm],[data-slot],[data-slot-tab],[data-slot-recipe],[data-menu-rm],[data-menu-open],[data-plan-day],[data-plan-meal]');
   if(!t){ if(ev.target.id==='dlg') closeDialog(); return; }
   if(t.dataset.fav!==undefined){
     ev.stopPropagation();
@@ -590,6 +713,15 @@ document.addEventListener('click', async ev=>{
     catch(e){ r.favorite=!val; render(); if(det.id===r.id) renderDetail(); toast(e.message); }
     return;
   }
+  if(t.dataset.menuRm){ ev.stopPropagation(); const id=t.dataset.menuRm; week.entries=week.entries.filter(e=>e.id!==id); renderMenu();
+    try{ await api('/api/menu/'+encodeURIComponent(id),{method:'DELETE'}); }catch(e){ toast(e.message); loadWeek(); } return; }
+  if(t.dataset.menuOpen){ const id=t.dataset.menuOpen, sv=+t.dataset.menuServ||null; closeMenu(); openDetail(id); if(sv){ det.servings=sv; renderDetail(); } return; }
+  if(t.dataset.slot){ const [d,m]=t.dataset.slot.split('|'); openSlotPicker(d,m); return; }
+  if(t.dataset.slotTab){ slotPick.tab=t.dataset.slotTab; renderSlotPicker(); return; }
+  if(t.dataset.slotRecipe){ const r=recipes.find(x=>x.id===t.dataset.slotRecipe);
+    if(await addMenuEntry({day:slotPick.day, meal:slotPick.meal, recipeId:r.id, servings:+r.servings||null})){ closeDialog(); toast(`${r.title} ajouté au menu`); } return; }
+  if(t.dataset.planDay){ planPick.day=t.dataset.planDay; renderPlanPicker(); return; }
+  if(t.dataset.planMeal){ planPick.meal=t.dataset.planMeal; renderPlanPicker(); return; }
   if(t.dataset.pickIng!==undefined){ const it=pick.items[+t.dataset.pickIng]; it.on=!it.on; renderShopPicker(); return; }
   if(t.dataset.shopRm){ ev.stopPropagation(); const id=t.dataset.shopRm; setShop(shop.filter(i=>i.id!==id));
     try{ setShop(await api('/api/shopping/'+encodeURIComponent(id),{method:'DELETE'})); }catch(e){ toast(e.message); loadShop(); } return; }
@@ -608,6 +740,16 @@ document.addEventListener('click', async ev=>{
   else if(a==='manual'){ closeDialog(); openEditor(blankDraft()); setTimeout(()=>$('#f-title')?.focus(),60); }
   else if(a==='close-dlg'){ closeDialog(); }
   else if(a==='add-shop'){ openShopPicker(); }
+  else if(a==='add-plan'){ openPlanPicker(); }
+  else if(a==='plan-prev'||a==='plan-next'){ planPick.start=addDays(planPick.start, a==='plan-next'?7:-7); const wd=(new Date(planPick.day+'T12:00:00').getDay()+6)%7; planPick.day=isoDay(addDays(planPick.start, wd)); renderPlanPicker(); }
+  else if(a==='plan-serv-'||a==='plan-serv+'){ planPick.servings=Math.max(1, planPick.servings+(a==='plan-serv+'?1:-1)); renderPlanPicker(); }
+  else if(a==='plan-confirm'){ const p=planPick, wk=mondayOf(new Date(p.day+'T12:00:00'));
+    const ok=await (async()=>{ try{ await api('/api/menu', jsonOpts('POST',{day:p.day, meal:p.meal, recipeId:p.recipeId, servings:p.servings})); return true; }catch(e){ toast(e.message); return false; } })();
+    if(ok){ closeDialog(); const d=new Date(p.day+'T12:00:00'); toast(`Ajouté au menu : ${DAYS[(d.getDay()+6)%7].toLowerCase()} ${d.getDate()}, ${MEAL_LABEL[p.meal].toLowerCase()}`); if(isoDay(wk)===isoDay(week.start)) loadWeek(); } }
+  else if(a==='close-menu'){ closeMenu(); }
+  else if(a==='week-prev'||a==='week-next'){ week.start=addDays(week.start, a==='week-next'?7:-7); week.entries=[]; renderMenu(); loadWeek(); }
+  else if(a==='week-now'){ week.start=mondayOf(new Date()); week.entries=[]; renderMenu(); loadWeek(); }
+  else if(a==='week-shop'){ openWeekShopPicker(); }
   else if(a==='pick-all'||a==='pick-none'){ pick.items.forEach(i=>i.on=a==='pick-all'); renderShopPicker(); }
   else if(a==='pick-confirm'){ confirmShopPicker(); }
   else if(a==='close-shopping'){ closeShopping(); }
@@ -635,15 +777,19 @@ document.addEventListener('click', async ev=>{
 });
 $('#btn-add').addEventListener('click', openAddMenu);
 $('#btn-shop').addEventListener('click', openShopping);
+$('#btn-menu').addEventListener('click', openMenu);
 $('#btn-fav').addEventListener('click', ()=>{ ui.fav=!ui.fav; render(); });
 $('#q').addEventListener('input', e=>{ ui.q=e.target.value; render(); });
+document.addEventListener('input', e=>{ if(e.target.id==='slot-q'){ slotPick.q=e.target.value; renderSlotPicker(); } });
 document.addEventListener('keydown', e=>{
-  if(e.key==='Escape'){ if(!$('#dlg').hidden) closeDialog(); else if(!$('#editor').hidden) closeEditor(); else if(!$('#importer').hidden) closeImporter(); else if(!$('#shopping').hidden) closeShopping(); else if(!$('#detail').hidden) closeDetail(); }
+  if(e.key==='Escape'){ if(!$('#dlg').hidden) closeDialog(); else if(!$('#editor').hidden) closeEditor(); else if(!$('#importer').hidden) closeImporter(); else if(!$('#shopping').hidden) closeShopping(); else if(!$('#menu').hidden) closeMenu(); else if(!$('#detail').hidden) closeDetail(); }
   if(e.key==='Enter' && e.target.matches?.('.card')) openDetail(e.target.dataset.open);
 });
 document.addEventListener('submit', e=>{
   if(e.target.id==='recipe-form'){ e.preventDefault(); submitEditor(); }
   if(e.target.id==='import-form'){ e.preventDefault(); runImport(); }
+  if(e.target.id==='slot-free-form'){ e.preventDefault(); const v=$('#slot-free').value.trim(); if(!v) return;
+    addMenuEntry({day:slotPick.day, meal:slotPick.meal, text:v}).then(ok=>{ if(ok) closeDialog(); }); }
   if(e.target.id==='shop-add-form'){ e.preventDefault(); const v=$('#shop-new').value.trim(); if(!v) return;
     api('/api/shopping/item', jsonOpts('POST',{text:v})).then(l=>{ setShop(l); setTimeout(()=>$('#shop-new')?.focus(),30); }).catch(err=>toast(err.message)); }
 });

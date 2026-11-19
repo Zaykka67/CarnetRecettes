@@ -87,6 +87,10 @@ with db() as _c:
     _c.execute("""CREATE TABLE IF NOT EXISTS recipes(
         id TEXT PRIMARY KEY, data TEXT NOT NULL,
         created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL)""")
+    _c.execute("""CREATE TABLE IF NOT EXISTS menu(
+        id TEXT PRIMARY KEY, day TEXT NOT NULL, meal TEXT NOT NULL, recipe_id TEXT, text TEXT NOT NULL DEFAULT '',
+        servings INTEGER, created_at INTEGER NOT NULL)""")
+    _c.execute("CREATE INDEX IF NOT EXISTS menu_day ON menu(day)")
     _c.execute("""CREATE TABLE IF NOT EXISTS shopping(
         id TEXT PRIMARY KEY, key TEXT NOT NULL, name TEXT NOT NULL, qty REAL, unit TEXT NOT NULL DEFAULT '',
         aisle TEXT NOT NULL, recipes TEXT NOT NULL DEFAULT '[]', checked INTEGER NOT NULL DEFAULT 0,
@@ -335,6 +339,7 @@ async def delete_recipe(rid: str):
         delete_photo(old.get("photo"))
         with db() as c:
             c.execute("DELETE FROM recipes WHERE id=?", (rid,))
+            c.execute("DELETE FROM menu WHERE recipe_id=?", (rid,))
     return Response(status_code=204)
 
 
@@ -388,7 +393,7 @@ async def shopping_add(request: Request):
     items = [i for i in (body.get("items") or [])[:100] if isinstance(i, dict)]
     with db() as c:
         for i in items:
-            add_to_shopping(c, i.get("name"), i.get("qty"), i.get("unit") or "", recipe)
+            add_to_shopping(c, i.get("name"), i.get("qty"), i.get("unit") or "", _s(i.get("recipe"), 160) or recipe)
     return shopping_list()
 
 
@@ -428,6 +433,60 @@ async def shopping_clear(request: Request):
         else:
             c.execute("DELETE FROM shopping WHERE checked=1")
     return shopping_list()
+
+
+# ---- Menus de la semaine ----------------------------------------------------------
+MEALS = ("midi", "soir")
+DAY_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+
+@app.get("/api/menu")
+async def get_menu(start: str, end: str):
+    if not (DAY_RE.match(start) and DAY_RE.match(end)):
+        raise HTTPException(400, "Dates invalides.")
+    with db() as c:
+        rows = c.execute("SELECT * FROM menu WHERE day BETWEEN ? AND ? ORDER BY day, meal, created_at", (start, end)).fetchall()
+    return [{"id": r["id"], "day": r["day"], "meal": r["meal"], "recipeId": r["recipe_id"], "text": r["text"],
+             "servings": r["servings"]} for r in rows]
+
+
+@app.post("/api/menu")
+async def add_menu(request: Request):
+    b = await request.json()
+    day, meal = str(b.get("day", "")), str(b.get("meal", ""))
+    if not DAY_RE.match(day) or meal not in MEALS:
+        raise HTTPException(400, "Choisis un jour et un repas.")
+    rid = _s(b.get("recipeId"), 40) or None
+    text = _s(b.get("text"), 120)
+    if rid and not get_recipe(rid):
+        raise HTTPException(404, "Recette introuvable.")
+    if not rid and not text:
+        raise HTTPException(400, "Choisis une recette ou écris ce que tu manges.")
+    mid = uuid.uuid4().hex[:12]
+    with db() as c:
+        c.execute("INSERT INTO menu VALUES (?,?,?,?,?,?,?)", (mid, day, meal, rid, text, _int(b.get("servings")), now_ms()))
+    return {"id": mid}
+
+
+@app.patch("/api/menu/{mid}")
+async def edit_menu(mid: str, request: Request):
+    b = await request.json()
+    with db() as c:
+        row = c.execute("SELECT * FROM menu WHERE id=?", (mid,)).fetchone()
+        if not row:
+            raise HTTPException(404, "Repas introuvable.")
+        day = b.get("day") if DAY_RE.match(str(b.get("day", ""))) else row["day"]
+        meal = b.get("meal") if b.get("meal") in MEALS else row["meal"]
+        serv = _int(b["servings"]) if "servings" in b else row["servings"]
+        c.execute("UPDATE menu SET day=?, meal=?, servings=? WHERE id=?", (day, meal, serv, mid))
+    return {"ok": True}
+
+
+@app.delete("/api/menu/{mid}")
+async def delete_menu(mid: str):
+    with db() as c:
+        c.execute("DELETE FROM menu WHERE id=?", (mid,))
+    return Response(status_code=204)
 
 
 # ---- Photos ------------------------------------------------------------------
