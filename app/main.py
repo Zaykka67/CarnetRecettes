@@ -829,7 +829,9 @@ async def gemini_import(info: dict, video: bytes | None, url: str, caption: str,
     log.info("Gemini : envoi en mode %s", mode)
     t0 = time.time()
     try:
-        res = await gemini_generate(prompt, video, imgs, audio)
+        # texte seul : réponse attendue en quelques secondes ; son/vidéo : plus long
+        res = await gemini_generate(prompt, video, imgs, audio,
+                                    per_model_timeout=25.0 if mode == "texte" else (60.0 if mode == "son + images" else 120.0))
     except GeminiError as e:
         log.info("Gemini indisponible (%s) : import sans IA", e)
         out = await free_import(info, url, caption, shots, source)

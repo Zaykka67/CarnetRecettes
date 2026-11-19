@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import glob
+import io
 import json
 import logging
 import os
@@ -27,7 +28,7 @@ GEMINI_BASE_URL = os.getenv("GEMINI_BASE_URL", "https://generativelanguage.googl
 # Les noms de modèles changent souvent : on essaie dans l'ordre et on garde le premier qui répond.
 GEMINI_MODELS = [m.strip() for m in os.getenv(
     "GEMINI_MODEL",
-    "gemini-3.5-flash,gemini-3.5-flash-lite,gemini-4-hydrogen,gemini-3.8-flash,gemini-3.6-flash,gemini-2.5-flash,gemini-flash-latest",
+    "gemini-3.5-flash-lite,gemini-3.5-flash,gemini-4-hydrogen,gemini-3.8-flash,gemini-3.6-flash,gemini-2.5-flash,gemini-flash-latest",
 ).split(",") if m.strip()]
 GEMINI_THINKING = os.getenv("GEMINI_THINKING", "low").strip().lower()   # low = réponse rapide
 MAX_INLINE_VIDEO = 14 * 1024 * 1024   # la requête complète doit rester sous 20 Mo
@@ -153,12 +154,18 @@ def extract_media(video: bytes, duration: float | None, with_audio: bool, n_spre
                 with open(a, "rb") as fh:
                     audio = fh.read()
         for k, t in enumerate(frame_times(duration, n_spread, n_end)):
-            out = os.path.join(tmp, f"f_{k:02d}.jpg")
+            # PNG : pas de souci de plage de couleurs (vidéos Instagram), conversion JPEG ensuite
+            out = os.path.join(tmp, f"f_{k:02d}.png")
             subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-ss", f"{t:.1f}", "-i", src,
-                            "-frames:v", "1", "-vf", "scale=-2:1280", "-q:v", "3", out], check=False, timeout=20)
+                            "-frames:v", "1", "-vf", "scale=-2:1280", out], check=False, timeout=20)
             if os.path.exists(out) and os.path.getsize(out) > 2000:
-                with open(out, "rb") as fh:
-                    frames.append(fh.read())
+                try:
+                    from PIL import Image
+                    buf = io.BytesIO()
+                    Image.open(out).convert("RGB").save(buf, "JPEG", quality=88)
+                    frames.append(buf.getvalue())
+                except Exception:  # noqa: BLE001
+                    pass
         log.info("Extraction : son %s Ko, %s images en %.1f s", len(audio or b"") // 1000, len(frames), time.time() - t0)
     except (subprocess.SubprocessError, OSError) as e:
         log.info("Extraction son/images impossible : %s", e)
@@ -196,7 +203,8 @@ def _parse_json(text: str) -> dict:
         raise
 
 
-async def gemini_generate(prompt: str, video: bytes | None, images: list[bytes], audio: bytes | None = None) -> dict:
+async def gemini_generate(prompt: str, video: bytes | None, images: list[bytes], audio: bytes | None = None,
+                          per_model_timeout: float = 60.0) -> dict:
     """Envoie vidéo + images + consigne à Gemini et renvoie le JSON de la fiche."""
     global _working_model
     parts: list[dict] = []
@@ -234,7 +242,11 @@ async def gemini_generate(prompt: str, video: bytes | None, images: list[bytes],
                 try:
                     r = await c.post(f"{GEMINI_BASE_URL}/v1beta/models/{model}:generateContent",
                                      headers={"x-goog-api-key": GEMINI_API_KEY, "content-type": "application/json"},
-                                     json=make_body(fast))
+                                     json=make_body(fast), timeout=httpx.Timeout(per_model_timeout, connect=10.0))
+                except httpx.TimeoutException:
+                    log.info("Gemini %s : pas de réponse en %.0f s, modèle suivant", model, per_model_timeout)
+                    r = None
+                    break
                 except httpx.HTTPError as e:
                     raise GeminiError("Impossible de joindre Gemini. Réessaie dans un instant.") from e
                 log.info("Gemini %s : HTTP %s en %.1f s%s", model, r.status_code, time.time() - t0,
@@ -245,6 +257,10 @@ async def gemini_generate(prompt: str, video: bytes | None, images: list[bytes],
                     fast = False
                     continue
                 break
+            if r is None:
+                last = "Gemini est surchargé"
+                busy.append(model)
+                continue
             if r.status_code in (404, 400) and ("not found" in r.text.lower() or "not supported" in r.text.lower()):
                 last = f"modèle {model} indisponible"
                 continue
