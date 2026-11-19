@@ -370,7 +370,7 @@ function openImporter(prefill={}){
 function closeImporter(){ if(imp){ imp.ctl?.abort(); imp.urls.forEach(u=>URL.revokeObjectURL(u)); } imp=null; $('#importer').hidden=true; lockScroll(); }
 function renderImporter(){
   const s=$('#importer');
-  const openMore = imp.caption || imp.files.length;
+  const openMore = imp.caption || imp.files.length || imp.forceMore;
   s.innerHTML=`<div class="sheet-bar">
       <button class="btn ghost" type="button" data-act="close-importer">Annuler</button>
       <span class="ttl">Importer une recette</span><span style="width:70px"></span>
@@ -419,21 +419,30 @@ async function runImport(){
   const url=imp.url.trim(), caption=imp.caption.trim();
   if(url && !safeUrl(url)){ imp.error="Ce lien ne semble pas valide : il doit commencer par https://"; renderImporter(); return; }
   if(!url && !caption && !imp.files.length){ imp.error="Colle un lien, du texte ou ajoute au moins une capture d'écran."; renderImporter(); return; }
-  imp.busy=true; imp.error=''; imp.ctl=new AbortController(); renderImporter();
+  imp.busy=true; imp.error=''; imp.timedOut=false; imp.ctl=new AbortController(); renderImporter();
+  const ctl=imp.ctl;
+  const timer=setTimeout(()=>{ if(imp && imp.ctl===ctl){ imp.timedOut=true; ctl.abort(); } }, 45000);
   try{
     const fd=new FormData(); fd.append('url',url); fd.append('caption',caption);
     for(const f of imp.files){ fd.append('images', await resizeImage(f,1600,.85), 'capture.jpg'); }
-    const res=await api('/api/import',{method:'POST', body:fd, signal:imp.ctl.signal});
-    if(!imp) return;
+    const res=await api('/api/import',{method:'POST', body:fd, signal:ctl.signal});
+    if(!imp || imp.ctl!==ctl) return;
     const notice = res.ai===false ? (res.notes || "Fiche pré-remplie : relis-la avant d'enregistrer.") : "Fiche rédigée par Claude : relis-la avant d'enregistrer." + (res.notes? ' '+res.notes : '');
     imp.busy=false;
     openEditor({...blankDraft(), ...res.draft}, {notice});
   }catch(e){
-    if(!imp) return;
+    if(!imp || imp.ctl!==ctl) return;
     imp.busy=false;
-    imp.error = e.name==='AbortError' ? '' : (e.message || "L'import a échoué. Réessaie.");
+    if(e.name==='AbortError'){
+      imp.error = imp.timedOut ? "La vidéo met trop de temps à répondre. Ouvre-la, copie sa description et colle-la dans « Texte en plus »." : '';
+      imp.forceMore = imp.timedOut;
+    } else {
+      imp.error = e.message || "L'import a échoué. Réessaie.";
+      imp.forceMore = e.status===422;
+    }
     renderImporter();
-  }
+    if(imp.forceMore) setTimeout(()=>$('#i-cap')?.focus(),60);
+  }finally{ clearTimeout(timer); }
 }
 
 /* ---------- Partage depuis une autre appli (menu « Partager ») ---------- */
@@ -492,7 +501,7 @@ document.addEventListener('click', async ev=>{
   else if(a==='close-editor'){ closeEditor(); }
   else if(a==='remove-photo'){ readEditor(); if(ed.previewUrl) URL.revokeObjectURL(ed.previewUrl); ed.photoFile=null; ed.previewUrl=null; ed.removePhoto=true; renderEditor(); }
   else if(a==='close-importer'){ closeImporter(); }
-  else if(a==='stop-import'){ imp?.ctl?.abort(); }
+  else if(a==='stop-import'){ if(imp){ const c=imp.ctl; imp.ctl=null; imp.busy=false; imp.error=''; c?.abort(); renderImporter(); } }
   else if(a==='import-manual'){ syncImportFields(); const cap=imp.caption.trim(); const cover=imp.files.at(-1)||null; const d={...blankDraft(), sourceUrl:imp.url.trim()};
     openEditor(d,{photoFile:cover, notice: cap? 'Ton texte est dans les étapes : répartis-le entre ingrédients et étapes.':'', stepsText:cap}); }
 });
