@@ -89,7 +89,7 @@ function cleanStep(s){ return s.replace(/^\s*(?:\d+[.)-]|[-•*·]|étape\s*\d+\
 
 let toastT;
 function toast(msg){ const t=$('#toast'); t.textContent=msg; t.hidden=false; clearTimeout(toastT); toastT=setTimeout(()=>t.hidden=true, 3200); }
-function lockScroll(){ document.body.style.overflow = ($('#detail').hidden && $('#editor').hidden && $('#importer').hidden) ? '' : 'hidden'; }
+function lockScroll(){ document.body.style.overflow = ($('#detail').hidden && $('#editor').hidden && $('#importer').hidden && $('#shopping').hidden) ? '' : 'hidden'; }
 
 async function resizeImage(file, max=1600, q=.85){
   let bmp; try{ bmp=await createImageBitmap(file,{imageOrientation:'from-image'}); }catch{ bmp=await createImageBitmap(file); }
@@ -128,6 +128,93 @@ async function loadRecipes(){
 }
 function upsertLocal(rec){ const i=recipes.findIndex(r=>r.id===rec.id); if(i>=0) recipes[i]=rec; else recipes.unshift(rec); try{ localStorage.setItem(CACHE_KEY, JSON.stringify(recipes)); }catch{} }
 
+/* ---------- Liste de courses ---------- */
+let shop=[];
+const SHOP_KEY='carnet-courses-v1';
+const PANTRY=['sel','poivre','eau','sel et poivre','sel, poivre','fleur de sel'];
+async function loadShop(){
+  try{ shop=await api('/api/shopping'); try{ localStorage.setItem(SHOP_KEY, JSON.stringify(shop)); }catch{} }
+  catch(e){ if(e.status===401) return; try{ shop=JSON.parse(localStorage.getItem(SHOP_KEY)||'[]'); }catch{ shop=[]; } }
+  renderShopBadge(); if(!$('#shopping').hidden) renderShopping();
+}
+function setShop(list){ shop=list; try{ localStorage.setItem(SHOP_KEY, JSON.stringify(shop)); }catch{} renderShopBadge(); if(!$('#shopping').hidden) renderShopping(); }
+function renderShopBadge(){ const n=shop.filter(i=>!i.checked).length, b=$('#shop-badge'); b.textContent=n; b.hidden=!n; }
+function niceQty(q,u){ // 100 cl -> 1 l ; 1500 g -> 1,5 kg
+  u=(u||'').toLowerCase();
+  if(u==='g' && q>=1000) return [q/1000,'kg'];
+  if(u==='cl' && q>=100) return [q/100,'l'];
+  if(u==='ml' && q>=1000) return [q/1000,'l'];
+  return [q,u||''];
+}
+function shopLine(i){
+  if(i.qty==null || i.qty==='') return {q:'', t:i.name};
+  const [q,u]=niceQty(i.qty,i.unit); i={...i, qty:q, unit:u};
+  if(i.unit) return {q:fmtNum(i.qty)+' '+i.unit, t:de(i.name)};
+  return {q:fmtNum(i.qty), t:i.name};
+}
+
+/* Fenêtre « Ajouter aux courses » depuis une recette */
+let pick=null;
+function openShopPicker(){
+  const r=recipes.find(x=>x.id===det.id); if(!r) return;
+  const base=+r.servings||0, cur=det.servings||base, factor= base&&cur? cur/base : 1;
+  pick={title:r.title, servings:cur, items:(r.ingredients||[]).map(i=>({
+    name:i.name, unit:i.unit||'', qty: i.qty!=null && i.qty!=='' ? Math.round(i.qty*factor*100)/100 : null,
+    on: !PANTRY.includes((i.name||'').trim().toLowerCase())
+  }))};
+  if(!pick.items.length){ toast("Cette recette n'a pas d'ingrédients."); return; }
+  renderShopPicker();
+}
+function renderShopPicker(){
+  const n=pick.items.filter(i=>i.on).length;
+  openDialog(`<h3>Ajouter aux courses</h3>
+    <p>${esc(pick.title)}${pick.servings?` · pour ${pick.servings} personne${pick.servings>1?'s':''}`:''}. Décoche ce que tu as déjà.</p>
+    <div class="pick-tools"><button type="button" data-act="pick-all">Tout cocher</button><button type="button" data-act="pick-none">Tout décocher</button></div>
+    <ul class="pick-list">${pick.items.map((i,k)=>{const d=shopLine(i); return `<li data-pick-ing="${k}" class="${i.on?'on':''}"><span class="check"></span><span class="txt">${d.q?`<span class="q">${esc(d.q)}</span> `:''}${esc(d.t)}</span></li>`;}).join('')}</ul>
+    <div class="formbar"><button class="btn" type="button" data-act="close-dlg">Annuler</button><button class="btn primary" type="button" data-act="pick-confirm" ${n?'':'disabled'}>Ajouter ${n} article${n>1?'s':''}</button></div>`);
+  $('#dlg-box').classList.add('wide');
+}
+async function confirmShopPicker(){
+  const items=pick.items.filter(i=>i.on).map(({name,qty,unit})=>({name,qty,unit}));
+  const btn=$('[data-act=pick-confirm]'); if(btn){ btn.disabled=true; btn.textContent='Ajout…'; }
+  try{
+    setShop(await api('/api/shopping/add', jsonOpts('POST',{recipeTitle:pick.title, items})));
+    closeDialog(); toast(`${items.length} article${items.length>1?'s':''} ajouté${items.length>1?'s':''} à la liste de courses`);
+  }catch(e){ if(btn){ btn.disabled=false; btn.textContent='Réessayer'; } toast(e.message); }
+}
+
+/* Écran liste de courses */
+function openShopping(){ renderShopping(); const s=$('#shopping'); s.hidden=false; s.scrollTop=0; lockScroll(); loadShop(); }
+function closeShopping(){ $('#shopping').hidden=true; lockScroll(); }
+function renderShopping(){
+  const s=$('#shopping'), total=shop.length, done=shop.filter(i=>i.checked).length;
+  const groups={}; shop.forEach(i=>{ (groups[i.aisle]=groups[i.aisle]||[]).push(i); });
+  s.innerHTML=`<div class="sheet-bar">
+      <button class="btn ghost" type="button" data-act="close-shopping">${ICON.back} Carnet</button>
+      <span class="ttl">Liste de courses</span><span style="width:70px"></span>
+    </div>
+    <div class="sheet-inner">
+      <div class="shop-head"><h2>Courses</h2>${total?`<span class="prog">${done} / ${total} pris</span>`:''}</div>
+      ${total?`<div class="progress"><span style="width:${Math.round(done/total*100)}%"></span></div>`:''}
+      <form class="shop-add" id="shop-add-form" novalidate>
+        <label for="shop-new" style="position:absolute;left:-9999px">Ajouter un article</label>
+        <input class="input" id="shop-new" placeholder="Ajouter : 2 baguettes, lessive…" autocomplete="off">
+        <button class="btn primary" type="submit">Ajouter</button>
+      </form>
+      ${!total?`<div class="shop-empty"><h3>Ta liste est vide</h3><p>Ouvre une recette et touche « Ajouter à la liste de courses » : les ingrédients arrivent ici, rangés par rayon.</p></div>`:
+      Object.keys(groups).map(a=>`<div class="shop-group"><h4>${esc(a)}</h4><ul class="shop-list">${groups[a].map(i=>{const d=shopLine(i); return `<li data-shop="${esc(i.id)}" class="${i.checked?'done':''}"><span class="check"></span><span class="txt">${d.q?`<span class="q">${esc(d.q)}</span> `:''}${esc(d.t)}${i.recipes&&i.recipes.length?`<span class="from">${esc(i.recipes.join(' · '))}</span>`:''}</span><button class="rm" type="button" data-shop-rm="${esc(i.id)}" aria-label="Retirer ${esc(i.name)}">✕</button></li>`;}).join('')}</ul></div>`).join('')}
+      ${total?`<div class="shop-actions">
+        <button class="btn" type="button" data-act="shop-share">${ICON.link} Envoyer la liste</button>
+        ${done?`<button class="btn" type="button" data-act="shop-clear-done">Retirer les articles pris (${done})</button>`:''}
+        <button class="btn danger" type="button" data-act="shop-clear-all">${ICON.trash} Tout effacer</button>
+      </div>`:''}
+    </div>`;
+}
+function shopText(){
+  const groups={}; shop.filter(i=>!i.checked).forEach(i=>{ (groups[i.aisle]=groups[i.aisle]||[]).push(i); });
+  return 'Liste de courses\n'+Object.entries(groups).map(([a,items])=>'\n'+a+'\n'+items.map(i=>{const d=shopLine(i); return '- '+(d.q?d.q+' ':'')+d.t;}).join('\n')).join('\n');
+}
+
 /* ---------- Connexion ---------- */
 function showLogin(){ $('#login').hidden=false; setTimeout(()=>$('#pwd').focus(),50); }
 $('#login-form').addEventListener('submit', async e=>{
@@ -137,7 +224,7 @@ $('#login-form').addEventListener('submit', async e=>{
   try{
     await api('/api/login', jsonOpts('POST',{password:$('#pwd').value}));
     $('#login').hidden=true; $('#pwd').value='';
-    await loadRecipes(); handleShare();
+    await loadRecipes(); loadShop(); handleShare();
   }catch(ex){ err.textContent=ex.message||'Connexion impossible.'; err.hidden=false; }
   finally{ btn.disabled=false; btn.textContent='Ouvrir'; }
 });
@@ -246,7 +333,8 @@ function renderDetail(){
       </div>
       <div class="r-cols">
         <section><h3>Ingrédients</h3>
-          ${(r.ingredients||[]).length? `<ul class="ing-list">${r.ingredients.map((i,k)=>{const d=ingDisplay(i,factor); return `<li data-ing="${k}" class="${det.ing.has(k)?'done':''}"><span class="check"></span><span class="txt">${d.q?`<span class="q">${esc(d.q)}</span> `:''}${esc(d.t)}</span></li>`;}).join('')}</ul>`:'<p class="hint" style="color:var(--muted)">Aucun ingrédient saisi.</p>'}
+          ${(r.ingredients||[]).length? `<ul class="ing-list">${r.ingredients.map((i,k)=>{const d=ingDisplay(i,factor); return `<li data-ing="${k}" class="${det.ing.has(k)?'done':''}"><span class="check"></span><span class="txt">${d.q?`<span class="q">${esc(d.q)}</span> `:''}${esc(d.t)}</span></li>`;}).join('')}</ul>
+          <button class="btn primary shop-cta" type="button" data-act="add-shop"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 4h2l2.4 11.2a2 2 0 0 0 2 1.6h7.7a2 2 0 0 0 2-1.5L21 8H6"/><circle cx="10" cy="20.5" r="1.3"/><circle cx="17" cy="20.5" r="1.3"/></svg> Ajouter à la liste de courses</button>`:'<p class="hint" style="color:var(--muted)">Aucun ingrédient saisi.</p>'}
         </section>
         <section><h3>Préparation</h3>
           ${(r.steps||[]).length? `<ol class="step-list">${r.steps.map((st,k)=>`<li data-step="${k}" class="${det.steps.has(k)?'done':''}"><span class="n">${k+1}</span><span class="txt">${esc(st)}</span></li>`).join('')}</ol>`:'<p class="hint" style="color:var(--muted)">Aucune étape saisie.</p>'}
@@ -482,7 +570,7 @@ function handleShare(){
 
 /* ---------- Dialogues ---------- */
 function openDialog(html){ $('#dlg-box').innerHTML=html; $('#dlg').hidden=false; $('#dlg-box').querySelector('button')?.focus(); }
-function closeDialog(){ $('#dlg').hidden=true; $('#dlg-box').innerHTML=''; }
+function closeDialog(){ $('#dlg').hidden=true; $('#dlg-box').innerHTML=''; $('#dlg-box').classList.remove('wide'); }
 function openAddMenu(){
   openDialog(`<h3>Ajouter une recette</h3>
     <button class="menu-opt" type="button" data-act="import">${ICON.spark}<div><b>Depuis une vidéo ou un lien</b><span>TikTok, Instagram, YouTube, site de cuisine : la fiche se pré-remplit toute seule.</span></div></button>
@@ -492,7 +580,7 @@ function openAddMenu(){
 
 /* ---------- Événements ---------- */
 document.addEventListener('click', async ev=>{
-  const t=ev.target.closest('[data-act],[data-season],[data-cat],[data-fav],[data-open],[data-ing],[data-step],[data-pick],[data-rmshot],[data-tab]');
+  const t=ev.target.closest('[data-act],[data-season],[data-cat],[data-fav],[data-open],[data-ing],[data-step],[data-pick],[data-rmshot],[data-tab],[data-pick-ing],[data-shop],[data-shop-rm]');
   if(!t){ if(ev.target.id==='dlg') closeDialog(); return; }
   if(t.dataset.fav!==undefined){
     ev.stopPropagation();
@@ -502,6 +590,11 @@ document.addEventListener('click', async ev=>{
     catch(e){ r.favorite=!val; render(); if(det.id===r.id) renderDetail(); toast(e.message); }
     return;
   }
+  if(t.dataset.pickIng!==undefined){ const it=pick.items[+t.dataset.pickIng]; it.on=!it.on; renderShopPicker(); return; }
+  if(t.dataset.shopRm){ ev.stopPropagation(); const id=t.dataset.shopRm; setShop(shop.filter(i=>i.id!==id));
+    try{ setShop(await api('/api/shopping/'+encodeURIComponent(id),{method:'DELETE'})); }catch(e){ toast(e.message); loadShop(); } return; }
+  if(t.dataset.shop){ const it=shop.find(i=>i.id===t.dataset.shop); if(!it) return; it.checked=!it.checked; setShop([...shop]);
+    try{ setShop(await api('/api/shopping/'+encodeURIComponent(it.id), jsonOpts('PATCH',{checked:it.checked}))); }catch(e){ toast(e.message); loadShop(); } return; }
   if(t.dataset.tab){ if(imp && !imp.busy){ syncImportFields(); imp.tab=t.dataset.tab; imp.error=''; renderImporter(); } return; }
   if(t.dataset.season){ ui.season=t.dataset.season; render(); return; }
   if(t.dataset.cat){ ui.cat=t.dataset.cat; render(); return; }
@@ -514,6 +607,16 @@ document.addEventListener('click', async ev=>{
   if(a==='import'){ closeDialog(); openImporter(); }
   else if(a==='manual'){ closeDialog(); openEditor(blankDraft()); setTimeout(()=>$('#f-title')?.focus(),60); }
   else if(a==='close-dlg'){ closeDialog(); }
+  else if(a==='add-shop'){ openShopPicker(); }
+  else if(a==='pick-all'||a==='pick-none'){ pick.items.forEach(i=>i.on=a==='pick-all'); renderShopPicker(); }
+  else if(a==='pick-confirm'){ confirmShopPicker(); }
+  else if(a==='close-shopping'){ closeShopping(); }
+  else if(a==='shop-clear-done'){ try{ setShop(await api('/api/shopping/clear', jsonOpts('POST',{mode:'checked'}))); }catch(e){ toast(e.message); } }
+  else if(a==='shop-clear-all'){ openDialog(`<h3>Effacer toute la liste ?</h3><p>Tous les articles seront retirés, même ceux pas encore pris.</p><div class="formbar"><button class="btn" type="button" data-act="close-dlg">Annuler</button><button class="btn primary" style="background:var(--danger);border-color:var(--danger);color:#fff" type="button" data-act="shop-clear-all-ok">Tout effacer</button></div>`); }
+  else if(a==='shop-clear-all-ok'){ closeDialog(); try{ setShop(await api('/api/shopping/clear', jsonOpts('POST',{mode:'all'}))); toast('Liste effacée'); }catch(e){ toast(e.message); } }
+  else if(a==='shop-share'){ const text=shopText();
+    if(navigator.share){ try{ await navigator.share({title:'Liste de courses', text}); return; }catch(e){ if(e.name==='AbortError') return; } }
+    try{ await navigator.clipboard.writeText(text); toast('Liste copiée : colle-la dans un SMS ou une note'); }catch{ toast("Impossible de copier la liste sur cet appareil."); } }
   else if(a==='reset'){ ui.season='all'; ui.cat='all'; ui.fav=false; ui.q=''; $('#q').value=''; render(); }
   else if(a==='close-detail'){ closeDetail(); }
   else if(a==='serv-'||a==='serv+'){ const r=recipes.find(x=>x.id===det.id); const base=+r.servings||1; det.servings=Math.max(1,(det.servings||base)+(a==='serv+'?1:-1)); renderDetail(); }
@@ -531,15 +634,18 @@ document.addEventListener('click', async ev=>{
     closeImporter(); openEditor(d,{photoFile:cover, notice: cap? 'Ton texte est dans les étapes : répartis-le entre ingrédients et étapes.':'', stepsText:cap}); }
 });
 $('#btn-add').addEventListener('click', openAddMenu);
+$('#btn-shop').addEventListener('click', openShopping);
 $('#btn-fav').addEventListener('click', ()=>{ ui.fav=!ui.fav; render(); });
 $('#q').addEventListener('input', e=>{ ui.q=e.target.value; render(); });
 document.addEventListener('keydown', e=>{
-  if(e.key==='Escape'){ if(!$('#dlg').hidden) closeDialog(); else if(!$('#editor').hidden) closeEditor(); else if(!$('#importer').hidden) closeImporter(); else if(!$('#detail').hidden) closeDetail(); }
+  if(e.key==='Escape'){ if(!$('#dlg').hidden) closeDialog(); else if(!$('#editor').hidden) closeEditor(); else if(!$('#importer').hidden) closeImporter(); else if(!$('#shopping').hidden) closeShopping(); else if(!$('#detail').hidden) closeDetail(); }
   if(e.key==='Enter' && e.target.matches?.('.card')) openDetail(e.target.dataset.open);
 });
 document.addEventListener('submit', e=>{
   if(e.target.id==='recipe-form'){ e.preventDefault(); submitEditor(); }
   if(e.target.id==='import-form'){ e.preventDefault(); runImport(); }
+  if(e.target.id==='shop-add-form'){ e.preventDefault(); const v=$('#shop-new').value.trim(); if(!v) return;
+    api('/api/shopping/item', jsonOpts('POST',{text:v})).then(l=>{ setShop(l); setTimeout(()=>$('#shop-new')?.focus(),30); }).catch(err=>toast(err.message)); }
 });
 document.addEventListener('change', e=>{
   if(e.target.id==='f-photo' && e.target.files?.[0]){ readEditor(); if(ed.previewUrl) URL.revokeObjectURL(ed.previewUrl); ed.photoFile=e.target.files[0]; ed.previewUrl=URL.createObjectURL(ed.photoFile); ed.removePhoto=false; renderEditor(); }
@@ -559,7 +665,7 @@ window.addEventListener('popstate', ()=>{
   else if(!$('#detail').hidden) closeDetail(true);
 });
 document.addEventListener('visibilitychange', ()=>{
-  if(document.visibilityState==='visible'){ if(det.id) keepAwake(true); if(loaded && $('#editor').hidden) loadRecipes(); }
+  if(document.visibilityState==='visible'){ if(det.id) keepAwake(true); if(loaded && $('#editor').hidden) loadRecipes(); if(loaded) loadShop(); }
 });
 window.addEventListener('online', ()=>{ if(offline) loadRecipes(); });
 
@@ -574,7 +680,7 @@ render();
 (async()=>{
   try{ cfg=await api('/api/config'); }catch{ cfg={ai:false, auth:false, loggedIn:true}; }
   if(cfg.auth && !cfg.loggedIn){ showLogin(); return; }
-  await loadRecipes();
+  await loadRecipes(); loadShop();
   handleShare();
   const h=location.hash; if(h.startsWith('#r-')){ const id=h.slice(3); if(recipes.find(r=>r.id===id)){ history.replaceState(null,'',location.pathname); openDetail(id); } }
 })();

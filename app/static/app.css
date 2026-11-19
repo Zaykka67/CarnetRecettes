@@ -237,3 +237,39 @@ html,body{overflow-x:hidden}
 @media (max-width:420px){.toggle-fav{padding:0 10px}.toggle-fav .t{display:none}}
 
 #editor{z-index:45}
+
+/* ---- Liste de courses ---- */
+.badge{min-width:20px;height:20px;padding:0 6px;border-radius:999px;background:var(--accent);color:var(--accent-ink);font-size:.75rem;font-weight:700;display:inline-grid;place-items:center;font-variant-numeric:tabular-nums}
+#btn-shop .badge{margin-left:2px}
+@media (max-width:420px){#btn-shop .t{display:none}}
+.shop-cta{margin-top:14px;width:100%;justify-content:center}
+.pick-list{list-style:none;margin:0;padding:0;display:grid;gap:2px;max-height:52vh;overflow-y:auto}
+.pick-list li{display:flex;gap:12px;align-items:flex-start;padding:9px 4px;border-bottom:1px solid var(--line);cursor:pointer}
+.pick-list li .check{border-radius:6px}
+.pick-list li.on .check{background:var(--accent);border-color:var(--accent)}
+.pick-list li.on .check::after{content:"";width:5px;height:9px;border:solid var(--accent-ink);border-width:0 2px 2px 0;transform:rotate(45deg) translate(-1px,-1px)}
+.pick-list li:not(.on) .txt{color:var(--muted)}
+.dialog.wide{max-width:460px}
+.pick-tools{display:flex;gap:14px;font-size:.88rem}
+.pick-tools button{background:none;border:0;color:var(--accent);font-weight:600;padding:0}
+.shop-head{display:flex;justify-content:space-between;align-items:baseline;gap:12px;padding:18px 0 4px}
+.shop-head h2{font-family:var(--display);font-weight:400;font-size:2.2rem}
+.shop-head .prog{color:var(--muted);font-variant-numeric:tabular-nums}
+.progress{height:6px;border-radius:99px;background:var(--soft);overflow:hidden;margin:6px 0 14px}
+.progress span{display:block;height:100%;background:var(--accent);transition:width .25s}
+.shop-add{display:flex;gap:8px;margin-bottom:14px}
+.shop-add .input{flex:1}
+.shop-group{margin-top:14px}
+.shop-group h4{margin:0 0 4px;font-size:.78rem;text-transform:uppercase;letter-spacing:.07em;color:var(--muted)}
+.shop-list{list-style:none;margin:0;padding:0;background:var(--surface);border:1px solid var(--line);border-radius:14px;overflow:hidden}
+.shop-list li{display:flex;align-items:center;gap:12px;padding:12px 12px;border-top:1px solid var(--line);cursor:pointer}
+.shop-list li:first-child{border-top:0}
+.shop-list .txt{flex:1;min-width:0}
+.shop-list .q{font-weight:650;font-variant-numeric:tabular-nums}
+.shop-list .from{display:block;font-size:.78rem;color:var(--muted);margin-top:1px}
+.shop-list li.done .txt{color:var(--muted);text-decoration:line-through}
+.shop-list .rm{width:30px;height:30px;border-radius:50%;border:0;background:transparent;color:var(--muted);font-size:1rem;flex:none}
+.shop-list .rm:hover{background:var(--soft)}
+.shop-actions{display:flex;flex-wrap:wrap;gap:8px;margin-top:22px}
+.shop-empty{text-align:center;color:var(--muted);padding:40px 10px}
+.shop-empty h3{font-family:var(--display);font-weight:400;font-size:1.8rem;color:var(--ink);margin-bottom:6px}

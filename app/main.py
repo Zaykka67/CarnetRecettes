@@ -33,7 +33,8 @@ from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from PIL import Image, ImageOps
 
-from .free_import import OCR_AVAILABLE, ocr_image, parse_recipe_text
+from .free_import import OCR_AVAILABLE, ocr_image, parse_ingredient, parse_recipe_text
+from .shopping import AISLES, aisle_of, display_qty, key_of, to_base
 VIDEO_MODE = os.getenv("GEMINI_VIDEO_MODE", "fast").strip().lower()   # fast = son + images, full = vidéo entière
 from .video_ai import GEMINI_API_KEY, GeminiError, extract_media, gemini_generate, ytdlp_fetch
 
@@ -86,6 +87,10 @@ with db() as _c:
     _c.execute("""CREATE TABLE IF NOT EXISTS recipes(
         id TEXT PRIMARY KEY, data TEXT NOT NULL,
         created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL)""")
+    _c.execute("""CREATE TABLE IF NOT EXISTS shopping(
+        id TEXT PRIMARY KEY, key TEXT NOT NULL, name TEXT NOT NULL, qty REAL, unit TEXT NOT NULL DEFAULT '',
+        aisle TEXT NOT NULL, recipes TEXT NOT NULL DEFAULT '[]', checked INTEGER NOT NULL DEFAULT 0,
+        created_at INTEGER NOT NULL)""")
 
 
 def now_ms() -> int:
@@ -331,6 +336,98 @@ async def delete_recipe(rid: str):
         with db() as c:
             c.execute("DELETE FROM recipes WHERE id=?", (rid,))
     return Response(status_code=204)
+
+
+# ---- Liste de courses ------------------------------------------------------------
+AISLE_ORDER = [a for a, _ in AISLES] + ["Autres"]
+
+
+def shopping_list() -> list[dict]:
+    with db() as c:
+        rows = c.execute("SELECT * FROM shopping ORDER BY created_at").fetchall()
+    items = []
+    for r in rows:
+        q, u = display_qty(r["qty"], r["unit"])
+        items.append({"id": r["id"], "name": r["name"], "qty": q, "unit": u, "aisle": r["aisle"],
+                      "recipes": json.loads(r["recipes"]), "checked": bool(r["checked"])})
+    items.sort(key=lambda i: (AISLE_ORDER.index(i["aisle"]) if i["aisle"] in AISLE_ORDER else 99))
+    return items
+
+
+def add_to_shopping(c: sqlite3.Connection, name: str, qty, unit: str, recipe: str = "") -> None:
+    name = _s(name, 200)
+    if not name:
+        return
+    qty = _num(qty)
+    bq, bu = to_base(qty, _s(unit, 30))
+    k = key_of(name) + "|" + bu
+    row = c.execute("SELECT * FROM shopping WHERE key=? AND checked=0", (k,)).fetchone()
+    if row:
+        recipes = json.loads(row["recipes"])
+        if recipe and recipe not in recipes:
+            recipes.append(recipe)
+        new_q = row["qty"]
+        if bq is not None:
+            new_q = (new_q or 0) + bq
+        c.execute("UPDATE shopping SET qty=?, recipes=? WHERE id=?", (new_q, json.dumps(recipes, ensure_ascii=False), row["id"]))
+    else:
+        c.execute("INSERT INTO shopping VALUES (?,?,?,?,?,?,?,0,?)",
+                  (uuid.uuid4().hex[:12], k, name, bq, bu, aisle_of(name),
+                   json.dumps([recipe] if recipe else [], ensure_ascii=False), now_ms()))
+
+
+@app.get("/api/shopping")
+async def get_shopping():
+    return shopping_list()
+
+
+@app.post("/api/shopping/add")
+async def shopping_add(request: Request):
+    body = await request.json()
+    recipe = _s(body.get("recipeTitle"), 160)
+    items = [i for i in (body.get("items") or [])[:100] if isinstance(i, dict)]
+    with db() as c:
+        for i in items:
+            add_to_shopping(c, i.get("name"), i.get("qty"), i.get("unit") or "", recipe)
+    return shopping_list()
+
+
+@app.post("/api/shopping/item")
+async def shopping_item(request: Request):
+    """Article ajouté à la main : « 2 kg pommes », « lessive »."""
+    text = _s((await request.json()).get("text"), 200)
+    if not text:
+        raise HTTPException(400, "Écris le nom de l'article.")
+    ing = parse_ingredient(text)
+    with db() as c:
+        add_to_shopping(c, ing["name"], ing["qty"], ing["unit"])
+    return shopping_list()
+
+
+@app.patch("/api/shopping/{iid}")
+async def shopping_check(iid: str, request: Request):
+    body = await request.json()
+    with db() as c:
+        c.execute("UPDATE shopping SET checked=? WHERE id=?", (1 if body.get("checked") else 0, iid))
+    return shopping_list()
+
+
+@app.delete("/api/shopping/{iid}")
+async def shopping_delete(iid: str):
+    with db() as c:
+        c.execute("DELETE FROM shopping WHERE id=?", (iid,))
+    return shopping_list()
+
+
+@app.post("/api/shopping/clear")
+async def shopping_clear(request: Request):
+    mode = (await request.json()).get("mode")
+    with db() as c:
+        if mode == "all":
+            c.execute("DELETE FROM shopping")
+        else:
+            c.execute("DELETE FROM shopping WHERE checked=1")
+    return shopping_list()
 
 
 # ---- Photos ------------------------------------------------------------------
