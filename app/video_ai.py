@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import glob
 import json
@@ -26,7 +27,7 @@ GEMINI_BASE_URL = os.getenv("GEMINI_BASE_URL", "https://generativelanguage.googl
 # Les noms de modèles changent souvent : on essaie dans l'ordre et on garde le premier qui répond.
 GEMINI_MODELS = [m.strip() for m in os.getenv(
     "GEMINI_MODEL",
-    "gemini-3.8-flash,gemini-3.6-flash,gemini-3.5-flash,gemini-3-flash-preview,gemini-2.5-flash,gemini-flash-latest",
+    "gemini-3.5-flash,gemini-3.5-flash-lite,gemini-4-hydrogen,gemini-3.8-flash,gemini-3.6-flash,gemini-2.5-flash,gemini-flash-latest",
 ).split(",") if m.strip()]
 GEMINI_THINKING = os.getenv("GEMINI_THINKING", "low").strip().lower()   # low = réponse rapide
 MAX_INLINE_VIDEO = 14 * 1024 * 1024   # la requête complète doit rester sous 20 Mo
@@ -51,13 +52,23 @@ def ytdlp_fetch(url: str, download: bool) -> dict:
         "format": "b[height<=480]/bv*[height<=480]+ba/b[height<=720]/bv*[height<=720]+ba/w/b",
         "merge_output_format": "mp4",
         "max_filesize": 40 * 1024 * 1024,
-        "skip_download": not download,
     }
+    try:  # se faire passer pour Chrome : TikTok refuse (403) les téléchargements « robot »
+        import curl_cffi  # noqa: F401
+        from yt_dlp.networking.impersonate import ImpersonateTarget
+        opts["impersonate"] = ImpersonateTarget.from_str("chrome")
+    except Exception:  # noqa: BLE001
+        pass
     try:
         with yt_dlp.YoutubeDL(opts) as y:
-            info = y.extract_info(url, download=download)
-        if info.get("_type") == "playlist" and info.get("entries"):
-            info = next(e for e in info["entries"] if e)
+            info = y.extract_info(url, download=False)
+            if info.get("_type") == "playlist" and info.get("entries"):
+                info = next(e for e in info["entries"] if e)
+            if download:
+                try:   # si la vidéo échoue, on garde quand même la description et la miniature
+                    y.process_ie_result(info, download=True)
+                except Exception as e:  # noqa: BLE001
+                    log.info("yt-dlp : vidéo non téléchargée (%s)", str(e)[:160])
         out["caption"] = (info.get("description") or info.get("title") or "").strip()
         out["author"] = info.get("uploader") or info.get("channel") or info.get("uploader_id") or ""
         out["thumb_url"] = info.get("thumbnail") or ""
@@ -150,8 +161,16 @@ async def gemini_generate(prompt: str, video: bytes | None, images: list[bytes])
 
     models = ([_working_model] if _working_model else []) + [m for m in GEMINI_MODELS if m != _working_model]
     last = "aucun modèle disponible"
+    busy: list[str] = []
     async with httpx.AsyncClient(timeout=httpx.Timeout(150.0, connect=10.0),
                                  transport=httpx.AsyncHTTPTransport(local_address="0.0.0.0")) as c:
+      for round_ in range(2):
+        if round_ == 1:
+            if not busy:
+                break
+            log.info("Gemini : modèles surchargés, nouvel essai dans 3 s")
+            await asyncio.sleep(3)
+            models, busy = busy, []
         for model in models:
             fast = True
             for _attempt in range(2):
@@ -173,6 +192,10 @@ async def gemini_generate(prompt: str, video: bytes | None, images: list[bytes])
             if r.status_code in (404, 400) and ("not found" in r.text.lower() or "not supported" in r.text.lower()):
                 last = f"modèle {model} indisponible"
                 continue
+            if r.status_code in (500, 503, 504):
+                last = "Gemini est surchargé"
+                busy.append(model)
+                continue
             if r.status_code == 429:
                 last = "quota gratuit atteint"
                 log.info("Gemini %s : %s", model, r.text[:300])
@@ -180,7 +203,7 @@ async def gemini_generate(prompt: str, video: bytes | None, images: list[bytes])
             if r.status_code in (401, 403):
                 raise GeminiError("La clé Gemini est refusée. Vérifie GEMINI_API_KEY dans Coolify.")
             if r.status_code != 200:
-                log.warning("Gemini %s : %s", model, r.text[:500])
+                log.warning("Gemini %s : %s", model, r.text[:300])
                 last = f"erreur {r.status_code}"
                 continue
             data = r.json()
@@ -194,6 +217,8 @@ async def gemini_generate(prompt: str, video: bytes | None, images: list[bytes])
                 return _parse_json(text)
             except (json.JSONDecodeError, ValueError) as e:
                 raise GeminiError("La réponse de Gemini était incomplète. Relance l'import.") from e
+    if last == "Gemini est surchargé":
+        raise GeminiError("Gemini est surchargé en ce moment. Réessaie dans une minute.")
     if last == "quota gratuit atteint":
         raise GeminiError("Le quota gratuit de Gemini est atteint pour le moment. Réessaie dans une minute ou demain.")
     raise GeminiError(f"Gemini n'a pas pu répondre ({last}).")

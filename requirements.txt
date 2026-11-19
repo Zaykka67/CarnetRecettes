@@ -5,3 +5,4 @@ pillow==12.3.0
 python-multipart==0.0.32
 pytesseract==0.3.13
 yt-dlp
+curl_cffi

@@ -408,7 +408,7 @@ def _text(raw: bytes | None) -> str:
 
 def _tiktok_from_html(html: str) -> dict:
     """Lit la légende et la miniature dans le HTML d'une page TikTok."""
-    res = {"caption": "", "author": "", "thumb_url": ""}
+    res = {"caption": "", "author": "", "thumb_url": "", "play_url": ""}
     m = re.search(r'<script[^>]+id="__UNIVERSAL_DATA_FOR_REHYDRATION__"[^>]*>(.*?)</script>', html, re.S)
     if m:
         try:
@@ -418,6 +418,14 @@ def _tiktok_from_html(html: str) -> dict:
             res["author"] = (item.get("author") or {}).get("uniqueId", "")
             video = item.get("video") or {}
             res["thumb_url"] = video.get("originCover") or video.get("cover") or video.get("dynamicCover") or ""
+            play = video.get("playAddr") or video.get("downloadAddr") or ""
+            if not play:
+                for br in video.get("bitrateInfo") or []:
+                    urls = ((br.get("PlayAddr") or {}).get("UrlList") or [])
+                    if urls:
+                        play = urls[0]
+                        break
+            res["play_url"] = play
             if not res["thumb_url"]:
                 imgs = ((item.get("imagePost") or {}).get("images") or [])
                 if imgs:
@@ -431,7 +439,7 @@ def _tiktok_from_html(html: str) -> dict:
     return res
 
 
-async def tiktok_info(c: httpx.AsyncClient, url: str, out: dict) -> str:
+async def tiktok_info(c: httpx.AsyncClient, url: str, out: dict, want_video: bool = False) -> str:
     """Récupère légende, auteur et miniature d'une vidéo TikTok. Renvoie l'URL de la miniature."""
 
     async def oembed(u: str) -> dict | None:
@@ -470,8 +478,29 @@ async def tiktok_info(c: httpx.AsyncClient, url: str, out: dict) -> str:
         elif final != url:
             out["url"] = final.split("?")[0]
             j = await oembed(out["url"])
+    if want_video:
+        if not html:
+            try:
+                r = await c.get(out["url"] if "/video/" in out["url"] else url)
+                html = r.text if r.status_code < 400 else ""
+            except httpx.HTTPError:
+                html = ""
+        play = _tiktok_from_html(html)["play_url"] if html else ""
+        if play:
+            try:
+                t0 = time.time()
+                vr = await c.get(play, headers={"Referer": "https://www.tiktok.com/", "Range": "bytes=0-"})
+                if vr.status_code < 400 and 0 < len(vr.content) <= 14 * 1024 * 1024:
+                    out["video"] = vr.content
+                log.info("TikTok vidéo (page) : HTTP %s, %s Ko en %.1f s", vr.status_code, len(vr.content) // 1000, time.time() - t0)
+            except httpx.HTTPError as e:
+                log.info("TikTok vidéo (page) : erreur %s", e)
+        else:
+            log.info("TikTok : adresse de la vidéo absente de la page")
     if j:
         out["caption"], out["author"] = j.get("title", "") or "", j.get("author_name", "") or ""
+        if not out["caption"] and html:
+            out["caption"] = _tiktok_from_html(html)["caption"]
         return j.get("thumbnail_url", "") or ""
     # 3. dernier recours : lire la page elle-même
     if html:
@@ -514,9 +543,9 @@ async def instagram_info(c: httpx.AsyncClient, url: str, out: dict) -> str:
     return _meta(html, "og:image")
 
 
-async def fetch_link_info(url: str) -> dict:
+async def fetch_link_info(url: str, want_video: bool = False) -> dict:
     """Récupère la légende, l'auteur et la miniature d'une vidéo ou d'une page."""
-    out = {"caption": "", "author": "", "thumb": None, "platform": "", "url": url}
+    out = {"caption": "", "author": "", "thumb": None, "platform": "", "url": url, "video": None}
     if not re.match(r"^https?://", url, re.I):
         return out
     # IPv4 forcé : dans Docker, une route IPv6 absente fait attendre chaque requête jusqu'au délai maximum
@@ -529,7 +558,7 @@ async def fetch_link_info(url: str) -> dict:
             out["platform"] = _platform(host)
             thumb_url = ""
             if "tiktok" in host:
-                thumb_url = await tiktok_info(c, url, out)
+                thumb_url = await tiktok_info(c, url, out, want_video)
             elif "youtu" in host:
                 r = await c.get("https://www.youtube.com/oembed", params={"url": url, "format": "json"})
                 if r.status_code == 200:
@@ -644,12 +673,18 @@ async def import_recipe(url: str = Form(""), caption: str = Form(""), source: st
                 video = yd["video"]
                 if yd["thumb_url"]:
                     info["thumb"] = await download_image(yd["thumb_url"])
-        if not (info["caption"] or info["thumb"] or video):
+        need_video = bool(GEMINI_API_KEY) and not video and "tiktok" in host
+        if need_video or not (info["caption"] or info["thumb"] or video):
             try:
-                info = await asyncio.wait_for(fetch_link_info(url), timeout=30)
+                page = await asyncio.wait_for(fetch_link_info(url, want_video=need_video), timeout=40)
             except asyncio.TimeoutError:
-                log.info("Lecture du lien abandonnée après 30 s : %s", url)
-                info = {**empty, "platform": _platform(host)}
+                log.info("Lecture du lien abandonnée après 40 s : %s", url)
+                page = {**empty, "platform": _platform(host), "video": None}
+            video = video or page.get("video")
+            if not (info["caption"] or info["thumb"]):
+                info = page
+            elif not info["thumb"] and page["thumb"]:
+                info["thumb"] = page["thumb"]
         log.info("Lecture du lien en %.1f s (légende %s, miniature %s, vidéo %s)", time.time() - t0,
                  "oui" if info["caption"] else "non", "oui" if info["thumb"] else "non", "oui" if video else "non")
     all_imgs = shots + ([info["thumb"]] if info["thumb"] else [])
