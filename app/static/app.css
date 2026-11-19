@@ -235,3 +235,5 @@ details.more .inner{display:grid;gap:18px}
 .searchrow,.seg,.chips{min-width:0}
 html,body{overflow-x:hidden}
 @media (max-width:420px){.toggle-fav{padding:0 10px}.toggle-fav .t{display:none}}
+
+#editor{z-index:45}

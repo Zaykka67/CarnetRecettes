@@ -171,6 +171,30 @@ def save_image(raw: bytes, max_side: int = 1600) -> str:
     return pid
 
 
+def crop_video_frame(raw: bytes) -> bytes:
+    """Sur une capture de téléphone (TikTok description ouverte), l'image de la vidéo est en haut :
+    on garde cette zone pour la photo de la fiche plutôt que le texte."""
+    try:
+        img = ImageOps.exif_transpose(Image.open(io.BytesIO(raw))).convert("RGB")
+    except Exception:  # noqa: BLE001
+        return raw
+    w, h = img.size
+    if h / w > 1.6:
+        img = img.crop((0, int(h * 0.06), w, int(h * 0.38)))
+        cw, ch = img.size
+        target = int(cw * 3 / 4)          # format 4:3 centré
+        if ch > target:
+            top = (ch - target) // 2
+            img = img.crop((0, top, cw, top + target))
+        elif ch < target:
+            nw = int(ch * 4 / 3)
+            left = (cw - nw) // 2
+            img = img.crop((left, 0, left + nw, ch))
+    buf = io.BytesIO()
+    img.save(buf, "JPEG", quality=88)
+    return buf.getvalue()
+
+
 def image_b64(raw: bytes, max_side: int = 1200) -> str:
     img = ImageOps.exif_transpose(Image.open(io.BytesIO(raw))).convert("RGB")
     img.thumbnail((max_side, max_side))
@@ -587,7 +611,7 @@ def parse_json_reply(text: str) -> dict:
 
 
 @app.post("/api/import")
-async def import_recipe(url: str = Form(""), caption: str = Form(""),
+async def import_recipe(url: str = Form(""), caption: str = Form(""), source: str = Form(""),
                         images: list[UploadFile] | None = File(None)):
     url = url.strip()
     log.info("Import demandé : lien=%s, texte=%s car., captures=%s", url or "-", len(caption), len(images or []))
@@ -614,7 +638,7 @@ async def import_recipe(url: str = Form(""), caption: str = Form(""),
         raise HTTPException(422, "Je n'ai rien pu lire depuis ce lien. Colle la description de la vidéo ou ajoute des captures d'écran.")
 
     if not ANTHROPIC_API_KEY:
-        return await free_import(info, url, caption, shots)
+        return await free_import(info, url, caption, shots, source)
 
     lines = []
     for i in range(len(shots)):
@@ -668,7 +692,7 @@ async def import_recipe(url: str = Form(""), caption: str = Form(""),
         except HTTPException:
             photo = None
 
-    res["sourceUrl"] = info["url"] or url
+    res["sourceUrl"] = info["url"] or url or source
     res["photo"] = photo
     draft = clean_recipe(res)
     draft["favorite"] = False
@@ -676,26 +700,27 @@ async def import_recipe(url: str = Form(""), caption: str = Form(""),
             "captionFound": bool(info["caption"].strip()), "platform": info["platform"]}
 
 
-async def free_import(info: dict, url: str, caption: str, shots: list[bytes]) -> dict:
+async def free_import(info: dict, url: str, caption: str, shots: list[bytes], source: str = "") -> dict:
     """Import sans IA : on découpe la légende et le texte lu sur les captures."""
     t0 = time.time()
     texts = await asyncio.gather(*(asyncio.to_thread(ocr_image, raw) for raw in shots))
     ocr_text = "\n".join(t for t in texts if t)
     if shots:
         log.info("OCR de %s capture(s) en %.1f s : %s caractères lus", len(shots), time.time() - t0, len(ocr_text))
-    res = parse_recipe_text(info["caption"], caption, ocr_text, info["author"])
-    cover = info["thumb"] or (shots[-1] if shots else None)
+    res = parse_recipe_text(info["caption"], caption, [t for t in texts if t], info["author"])
     photo = None
-    if cover:
-        try:
-            photo = {"id": save_image(cover)}
-        except HTTPException:
-            photo = None
+    try:
+        if info["thumb"]:
+            photo = {"id": save_image(info["thumb"])}
+        elif shots:
+            photo = {"id": save_image(crop_video_frame(shots[0]))}
+    except HTTPException:
+        photo = None
     notes = res.pop("notes")
     if info["platform"] and not info["caption"] and not caption and not ocr_text:
         notes = (f"Je n'ai pas pu lire la description sur {info['platform']}. "
                  "Colle-la dans « Texte en plus » ou ajoute des captures d'écran.")
-    res["sourceUrl"] = info["url"] or url
+    res["sourceUrl"] = info["url"] or url or source
     res["photo"] = photo
     draft = clean_recipe(res)
     draft["favorite"] = False

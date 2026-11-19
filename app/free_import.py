@@ -25,15 +25,18 @@ def ocr_image(raw: bytes) -> str:
         return ""
     try:
         import pytesseract
+        from PIL import ImageStat
         img = ImageOps.exif_transpose(Image.open(io.BytesIO(raw))).convert("L")
-        if max(img.size) < 1600:  # agrandir aide Tesseract
-            scale = 1600 / max(img.size)
-            img = img.resize((int(img.width * scale), int(img.height * scale)))
-        txt = pytesseract.image_to_string(img, lang="fra", config="--psm 6")
+        if ImageStat.Stat(img).mean[0] < 110:      # mode sombre : texte clair sur fond foncé
+            img = ImageOps.invert(img)
+        img = ImageOps.autocontrast(img)
+        if img.width < 1500:                       # capture de téléphone : on agrandit le petit texte
+            scale = 1500 / img.width
+            img = img.resize((int(img.width * scale), int(img.height * scale)), Image.LANCZOS)
+        txt = pytesseract.image_to_string(img, lang="fra", config="--psm 6", timeout=25)
         lines = [ln.strip() for ln in txt.splitlines()]
-        # on garde les lignes qui ressemblent à du texte (au moins 3 lettres)
         return "\n".join(ln for ln in lines if len(re.findall(r"[A-Za-zÀ-ÿ]", ln)) >= 3)
-    except Exception:  # noqa: BLE001
+    except Exception:  # noqa: BLE001  (délai dépassé, image illisible…)
         return ""
 
 
@@ -67,10 +70,12 @@ def normalize(text: str) -> str:
     text = re.sub(r"https?://\S+", " ", text)          # liens
     text = EMOJI_RE.sub("\n", text)                    # les emojis servent souvent de puces
     text = re.sub(r"[•▪◦●○►▶➡→✔✓☑✅]", "\n", text)
-    text = re.sub(r"(?<=\s)[-–—*]\s+", "\n", text)     # « - 200 g farine » en milieu de ligne
+    if text.count("\n") < 3:                           # légende sur une seule ligne : « - » sert de puce
+        text = re.sub(r"(?<=\s)[-–—*]\s+(?=\S)", "\n", text)
+    text = re.sub(r"(?m)^\s*[-–—*]\s+", "", text)      # puce en début de ligne
     text = re.sub(r"(?:^|\s)(\d{1,2})\s*[).]\s+(?=[A-Za-zÀ-ÿ])", r"\n\1. ", text)  # « 1) Mélanger »
     text = text.replace("\r", "")
-    lines = [re.sub(r"[ \t]+", " ", ln).strip(" .,;:-–—*") for ln in text.split("\n")]
+    lines = [re.sub(r"[ \t]+", " ", ln).strip(" .,;:-–—*|[]{}_~") for ln in text.split("\n")]
     return "\n".join(ln for ln in lines if ln)
 
 
@@ -82,13 +87,13 @@ def _strip_accents(s: str) -> str:
 # Ingrédients
 # --------------------------------------------------------------------------
 UNIT_RE = re.compile(
-    r"^(kg|mg|g|gr|grammes?|ml|cl|dl|l|litres?|c\.?\s?à\s?s\.?|c\.?\s?à\s?c\.?|càs|càc|cas|cac|cs|cc|"
+    r"^(kg|mg|g|gr|grammes?|ml|cl|ci|dl|l|litres?|c\.?\s?à\s?s\.?|c\.?\s?à\s?c\.?|càs|càc|cas|cac|cs|cc|"
     r"cuill[eè]res?\s+à\s+soupe|cuill[eè]res?\s+à\s+caf[eé]|pinc[ée]es?|sachets?|tranches?|gousses?|brins?|"
     r"verres?|tasses?|bottes?|feuilles?|bo[iî]tes?|pots?|poign[ée]es?|filets?|morceaux?|noix|noisettes?|"
     r"rouleaux?|pâtes?\s+feuillet[ée]es?|cubes?|briques?|bouquets?|branches?|zestes?)(?=[\s.]|$)\.?\s*",
     re.I,
 )
-QTY_RE = re.compile(r"^(\d+(?:[.,]\d+)?(?:\s*/\s*\d+)?(?!\d)|[½¼¾⅓⅔]|(?:un|une|deux|trois|quatre|cinq|six|demi)\b)\s*", re.I)
+QTY_RE = re.compile(r"^(\d+(?:[.,]\d+)?(?:\s*(?:-|à|a)\s*\d+(?:[.,]\d+)?)?(?:\s*/\s*\d+)?(?!\d)|[½¼¾⅓⅔]|(?:un|une|deux|trois|quatre|cinq|six|demi)\b)\s*", re.I)
 WORD_NUM = {"un": 1, "une": 1, "deux": 2, "trois": 3, "quatre": 4, "cinq": 5, "six": 6, "demi": 0.5}
 FRAC = {"½": 0.5, "¼": 0.25, "¾": 0.75, "⅓": 1 / 3, "⅔": 2 / 3}
 
@@ -99,6 +104,8 @@ def _norm_unit(u: str) -> str:
         return "c. à s."
     if re.fullmatch(r"c\.?\s?à\s?c\.?|càc|cac|cc|cuill[eè]res?\s+à\s+caf[eé]", x):
         return "c. à c."
+    if x in ("ci", "c1"):
+        return "cl"
     if x in ("gr", "gramme", "grammes"):
         return "g"
     if x in ("litre", "litres"):
@@ -108,6 +115,9 @@ def _norm_unit(u: str) -> str:
 
 def _to_num(s: str):
     s = s.lower().replace(" ", "")
+    rng = re.match(r"^(\d+(?:[.,]\d+)?)(?:-|à|a)(\d+(?:[.,]\d+)?)$", s)
+    if rng:  # fourchette : on garde la valeur haute
+        s = rng.group(2)
     if s in FRAC:
         return FRAC[s]
     if s in WORD_NUM:
@@ -136,6 +146,7 @@ def parse_ingredient(line: str) -> dict:
         if u:
             unit = _norm_unit(u.group(1))
             rest = rest[u.end():]
+        rest = re.sub(r"^[:\-–]\s*", "", rest)
         rest = re.sub(r"^(de |d['’]|d’)", "", rest, flags=re.I)
     else:
         # « Farine : 200 g » ou « farine 200g »
@@ -200,15 +211,15 @@ SEASON_WORDS = {
     "printemps": ["asperge", "petits pois", "petit pois", "radis", "fraise", "rhubarbe", "artichaut", "feve",
                   "ail des ours", "cresson", "agneau", "oseille", "morille", "printemps"],
     "ete": ["tomate", "courgette", "aubergine", "poivron", "melon", "pasteque", "peche", "abricot", "cerise",
-            "framboise", "myrtille", "basilic", "concombre", "mais", "nectarine", "mure", "groseille", "gaspacho",
+            "framboise", "myrtille", "basilic", "concombre", "nectarine", "mure", "groseille", "gaspacho",
             "barbecue", "bbq", "ratatouille", "ete", "estival", "glace", "sorbet"],
     "automne": ["potiron", "potimarron", "courge", "butternut", "citrouille", "champignon", "cepe", "girolle",
                 "chataigne", "marron", "pomme", "poire", "raisin", "coing", "figue", "patate douce", "noix",
-                "automne", "halloween"],
+                "automne", "halloween", "soupe", "veloute"],
     "hiver": ["poireau", "chou", "endive", "celeri", "panais", "topinambour", "orange", "clementine", "mandarine",
               "pamplemousse", "kiwi", "raclette", "fondue", "tartiflette", "vin chaud", "pot-au-feu", "pot au feu",
               "chocolat chaud", "galette des rois", "buche", "noel", "hiver", "blanquette", "bourguignon",
-              "choucroute", "cassoulet", "potee"],
+              "choucroute", "cassoulet", "potee", "soupe", "veloute"],
 }
 CATEGORY_WORDS = [
     ("Boisson", ["smoothie", "cocktail", "mocktail", "jus ", "latte", "milkshake", "limonade", "boisson",
@@ -231,11 +242,14 @@ CATEGORY_WORDS = [
 
 def guess_seasons(text: str) -> list[str]:
     t = _strip_accents(text)
+    t = re.sub(r"(sauce|coulis|concentre|puree|pulpe|tomates? pelees?|passata)\s*(de |d')?\s*tomates?", " ", t)
     scores = {}
     for season, words in SEASON_WORDS.items():
         n = sum(1 for w in words if re.search(rf"\b{re.escape(w)}s?\b", t))
         if n:
             scores[season] = n
+    if re.search(r"\bma[iï]s (doux|en grains?|grill[ée])|\bmaïs\b", text.lower()):
+        scores["ete"] = scores.get("ete", 0) + 1   # « maïs » sans confondre avec « mais »
     if not scores:
         return []
     best = max(scores.values())
@@ -243,9 +257,11 @@ def guess_seasons(text: str) -> list[str]:
 
 
 def guess_category(title: str, text: str) -> str:
-    for source in (_strip_accents(title), _strip_accents(text)):
+    for idx, source in enumerate((_strip_accents(title), _strip_accents(text))):
         for cat, words in CATEGORY_WORDS:
-            if any(w in source for w in words):
+            if cat == "Sauce" and idx == 1:
+                continue  # « sauce tomate » dans les ingrédients ne fait pas une sauce
+            if any(re.search(rf"\b{re.escape(w.strip())}", source) for w in words):
                 return cat
     return "Plat"
 
@@ -282,10 +298,12 @@ def guess_times(text: str) -> tuple[int | None, int | None, int | None]:
 # Assemblage
 # --------------------------------------------------------------------------
 def make_title(lines: list[str], author: str) -> str:
-    for ln in lines[:4]:
+    for ln in lines[:6]:
         if ING_HEAD.match(ln) or STEP_HEAD.match(ln) or NOISE.search(ln) or looks_like_ingredient(ln):
             continue
-        t = re.split(r"(?<=[.!?])\s", ln)[0].strip(" !.?:")
+        if ln[:1].islower():
+            continue
+        t = re.split(r"(?<=[.!?])\s", ln)[0].strip(" !.?:|[]")
         t = re.sub(r"^(recette( de| du| des)?|ma recette( de| du| des)?)\s+", "", t, flags=re.I)
         t = re.sub(r"\s+pour\s+\d+\s*(personnes?|pers|parts?|portions?)\b.*$", "", t, flags=re.I)
         if len(t) > 70:
@@ -295,45 +313,65 @@ def make_title(lines: list[str], author: str) -> str:
     return f"Recette de {author}" if author else "Nouvelle recette"
 
 
-def parse_recipe_text(caption: str, extra: str = "", ocr: str = "", author: str = "") -> dict:
-    raw_all = "\n".join(x for x in (caption, extra, ocr) if x)
+def parse_recipe_text(caption: str, extra: str = "", ocr: str | list[str] = "", author: str = "") -> dict:
+    ocr_blocks = ocr if isinstance(ocr, list) else ([ocr] if ocr else [])
+    blocks = [b for b in [caption, extra, *ocr_blocks] if b and b.strip()]
+    raw_all = "\n".join(blocks)
     tags = extract_tags(raw_all)
-    text = normalize(raw_all)
-    lines = [ln for ln in text.split("\n") if ln and not NOISE.search(ln)]
+    block_lines = [[ln for ln in normalize(b).split("\n") if ln and not NOISE.search(ln)] for b in blocks]
+    all_lines = [ln for bl in block_lines for ln in bl]
 
-    title = make_title(lines, author)
+    title = make_title(all_lines, author)
     ingredients, steps, others = [], [], []
-    mode = None
-    for ln in lines:
-        h = ING_HEAD.match(ln)
-        if h:
-            mode = "ing"
-            ln = ln[h.end():].strip()
-            if not ln:
+    for lines in block_lines:
+        mode = None                      # chaque capture repart sans section connue
+        for ln in lines:
+            h = ING_HEAD.match(ln)
+            if h:
+                mode = "ing"
+                ln = ln[h.end():].strip()
+                ln = re.sub(r"^pour\s*\d+\s*(personnes?|pers|parts?|portions?)?\s*:?\s*", "", ln, flags=re.I)
+                if not ln:
+                    continue
+            h = STEP_HEAD.match(ln)
+            if h and not looks_like_ingredient(ln):
+                mode = "step"
+                ln = ln[h.end():].strip()
+                if not ln:
+                    continue
+            if ln == title or ln.rstrip("…") == title.rstrip("…") or ln.startswith(title.rstrip("…")):
                 continue
-        h = STEP_HEAD.match(ln)
-        if h and not looks_like_ingredient(ln):
-            mode = "step"
-            ln = ln[h.end():].strip()
-            if not ln:
+            if META.match(ln):
                 continue
-        if ln == title or ln.rstrip("…") == title.rstrip("…") or ln.startswith(title.rstrip("…")):
-            continue
-        if META.match(ln):
-            continue
-        if mode == "ing" and not looks_like_step(ln):
-            # « 200 g farine, 2 œufs, sel » sur une seule ligne
-            parts = [p.strip() for p in re.split(r",|;|\bet\b(?=\s+\d)", ln) if p.strip()]
-            ingredients.extend(parts if len(parts) > 1 else [ln])
-        elif mode == "step":
-            steps.append(ln)
-        elif looks_like_ingredient(ln):
-            ingredients.append(ln)
-        elif looks_like_step(ln):
-            steps.append(ln)
-        else:
-            others.append(ln)
+            # ligne coupée par l'écran : « …ajouter » / « le bouillon »
+            if ln[:1].islower() and mode == "step" and steps and not re.search(r"[.!?]$", steps[-1]):
+                steps[-1] = steps[-1] + " " + ln
+                continue
+            if mode == "ing":
+                ln = re.sub(r"^[lI|]['’]?\s*(?=[a-zà-ÿ]{3})", "1 ", ln)   # OCR : « 1 oignon » lu « l'oignon »
+            if mode == "ing" and not looks_like_step(ln):
+                parts = [p.strip() for p in re.split(r",|;", ln) if p.strip()]
+                if len(parts) > 1 and sum(1 for p in parts if QTY_RE.match(p)) >= 2:
+                    ingredients.extend(parts)   # « 200 g farine, 2 œufs » sur une ligne
+                else:
+                    ingredients.append(ln)
+            elif mode == "step":
+                steps.append(ln)
+            elif looks_like_ingredient(ln):
+                ingredients.append(ln)
+            elif looks_like_step(ln):
+                steps.append(ln)
+            else:
+                others.append(ln)
 
+    ing_keys = {_strip_accents(i)[:30] for i in ingredients}
+    others = [o for o in others if _strip_accents(o)[:30] not in ing_keys]
+    # une ligne courte sans quantité, entre deux ingrédients (« Parmesan »), est un ingrédient
+    known = {_strip_accents(i)[:30] for i in ingredients}
+    for o in list(others):
+        if len(o) <= 30 and not looks_like_step(o) and o[:1].isupper() and len(o.split()) <= 3 \
+                and any(_strip_accents(o) in k or k.endswith(_strip_accents(o)) for k in known):
+            others.remove(o)
     split_steps = []
     for st in steps:
         split_steps.extend(x for x in re.split(r"(?<=[.!?])\s+(?=[A-ZÀ-Ý])", st) if x.strip())

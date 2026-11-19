@@ -360,40 +360,44 @@ async function submitEditor(){
 }
 
 /* ---------- Import ---------- */
-let imp=null; // {files, urls, busy, ctl, error, url, caption}
+let imp=null; // {tab, files, urls, busy, ctl, error, url, caption, started}
 function openImporter(prefill={}){
   closeImporter();
-  imp={files:[], urls:[], busy:false, ctl:null, error:'', url:prefill.url||'', caption:prefill.caption||''};
+  imp={tab:prefill.tab||'link', files:[], urls:[], busy:false, ctl:null, error:'', url:prefill.url||'', caption:prefill.caption||''};
   renderImporter(); const s=$('#importer'); s.hidden=false; s.scrollTop=0; lockScroll();
   if(prefill.autoStart && imp.url) runImport();
 }
-function closeImporter(){ if(imp){ imp.ctl?.abort(); imp.urls.forEach(u=>URL.revokeObjectURL(u)); } imp=null; $('#importer').hidden=true; lockScroll(); }
+function closeImporter(){ if(imp){ imp.ctl?.abort(); clearInterval(imp.tick); imp.urls.forEach(u=>URL.revokeObjectURL(u)); } imp=null; $('#importer').hidden=true; lockScroll(); }
 function renderImporter(){
-  const s=$('#importer');
-  const openMore = imp.caption || imp.files.length || imp.forceMore;
+  const s=$('#importer'), link=imp.tab==='link', dis=imp.busy?'disabled':'';
+  const tabs=`<div class="seg" role="tablist" aria-label="Type d'import" style="margin-top:18px">
+      <button type="button" role="tab" data-tab="link" aria-pressed="${link}" ${dis}>${ICON.link} Lien / vidéo</button>
+      <button type="button" role="tab" data-tab="shots" aria-pressed="${!link}" ${dis}>${ICON.img.replace('<svg','<svg width="16" height="16"')} Captures / texte</button>
+    </div>`;
+  const linkPane=`
+      <div class="field"><label for="i-url">Lien de la vidéo ou de la page</label>
+        <input class="input" id="i-url" type="url" inputmode="url" placeholder="https://vm.tiktok.com/…" value="${esc(imp.url)}" ${dis}>
+        <p class="hint">TikTok, YouTube, Instagram ou un site de cuisine. L'appli lit la description et la miniature de la vidéo${cfg.ai?', puis Claude rédige la fiche':''}.</p></div>`;
+  const shotsPane=`
+      <div class="field"><span class="lab">Captures d'écran (${imp.files.length}/${MAX_SHOTS})</span>
+        <div class="drop" id="i-drop">
+          ${imp.files.length?`<div class="shots">${imp.urls.map((u,k)=>`<div class="shot"><img src="${esc(u)}" alt="Capture ${k+1}"><button type="button" data-rmshot="${k}" aria-label="Retirer la capture ${k+1}" ${dis}>✕</button></div>`).join('')}</div>`:''}
+          ${imp.files.length<MAX_SHOTS && !imp.busy?`<span class="btn ${imp.files.length?'':'primary'} filebtn">${ICON.img} ${imp.files.length?'Ajouter une capture':'Choisir des captures'}<input type="file" accept="image/*" multiple id="i-shots" aria-label="Choisir des captures"></span>`:''}
+          <p class="hint">Dans TikTok, ouvre la description de la vidéo et fais une capture de la liste des ingrédients et des étapes (plusieurs captures si c'est long). L'appli lit le texte ; la dernière capture sert de photo.</p>
+        </div></div>
+      <div class="field"><label for="i-cap">Ou colle le texte de la recette</label><textarea class="input" id="i-cap" rows="5" placeholder="Copie la description de la vidéo et colle-la ici…" ${dis}>${esc(imp.caption)}</textarea></div>
+      <div class="field"><label for="i-src">Lien de la vidéo (facultatif, pour la retrouver)</label><input class="input" id="i-src" type="url" inputmode="url" placeholder="https://vm.tiktok.com/…" value="${esc(imp.url)}" ${dis}></div>`;
+  const busyLabel = link ? 'Lecture de la vidéo…' : (imp.files.length? 'Lecture des captures…' : 'Analyse du texte…');
   s.innerHTML=`<div class="sheet-bar">
       <button class="btn ghost" type="button" data-act="close-importer">Annuler</button>
       <span class="ttl">Importer une recette</span><span style="width:70px"></span>
     </div>
     <div class="sheet-inner">
+      ${tabs}
       <form class="f" id="import-form" novalidate>
-        <div class="field"><label for="i-url">Lien de la vidéo ou de la page</label>
-          <input class="input" id="i-url" type="url" inputmode="url" placeholder="https://vm.tiktok.com/…" value="${esc(imp.url)}" ${imp.busy?'disabled':''}>
-          <p class="hint">TikTok, Instagram, YouTube ou un site de cuisine. L'appli lit la description et la miniature de la vidéo${cfg.ai?', puis Claude rédige la fiche':' et range les ingrédients et les étapes'}.</p></div>
-        <details class="more" ${openMore?'open':''}>
-          <summary>La recette n'est que dite à l'oral ? Ajoute du texte ou des captures</summary>
-          <div class="inner">
-            <div class="field"><label for="i-cap">Texte en plus</label><textarea class="input" id="i-cap" rows="5" placeholder="Ingrédients notés en commentaire, ce que tu as retenu de la vidéo…" ${imp.busy?'disabled':''}>${esc(imp.caption)}</textarea></div>
-            <div class="field"><span class="lab">Captures d'écran (${imp.files.length}/${MAX_SHOTS})</span>
-              <div class="drop" id="i-drop">
-                ${imp.files.length?`<div class="shots">${imp.urls.map((u,k)=>`<div class="shot"><img src="${esc(u)}" alt="Capture ${k+1}"><button type="button" data-rmshot="${k}" aria-label="Retirer la capture ${k+1}">✕</button></div>`).join('')}</div>`:''}
-                ${imp.files.length<MAX_SHOTS && !imp.busy?`<span class="btn filebtn">${ICON.img} Ajouter des captures<input type="file" accept="image/*" multiple id="i-shots" aria-label="Ajouter des captures"></span>`:''}
-                <p class="hint">${cfg.ai?'Fais des captures des étapes et du plat fini : Claude les lit et choisit la plus belle comme photo.':'Fais des captures où la liste des ingrédients ou les étapes sont écrites : l\'appli lit le texte. La dernière capture sert de photo si la vidéo n\'a pas de miniature.'}</p>
-              </div></div>
-          </div>
-        </details>
+        ${link?linkPane:shotsPane}
         ${imp.error?`<div class="callout warn">${esc(imp.error)}</div>`:''}
-        ${imp.busy?`<div class="working"><span class="spinner"></span><span style="flex:1">${cfg.ai?"Lecture de la vidéo et rédaction de la fiche… jusqu'à une minute.":'Lecture de la vidéo…'}</span><button class="btn" type="button" data-act="stop-import">Arrêter</button></div>`:
+        ${imp.busy?`<div class="working"><span class="spinner"></span><span style="flex:1">${busyLabel} <span id="i-elapsed" style="color:var(--muted);font-variant-numeric:tabular-nums"></span></span><button class="btn" type="button" data-act="stop-import">Arrêter</button></div>`:
         `<div class="formbar">
           <button class="btn" type="button" data-act="import-manual">Saisir moi-même</button>
           <button class="btn primary" type="submit">${ICON.spark} Créer la fiche</button>
@@ -401,7 +405,7 @@ function renderImporter(){
       </form>
     </div>`;
 }
-function syncImportFields(){ if(!imp) return; const u=$('#i-url'), c=$('#i-cap'); if(u) imp.url=u.value; if(c) imp.caption=c.value; }
+function syncImportFields(){ if(!imp) return; const u=$('#i-url')||$('#i-src'), c=$('#i-cap'); if(u) imp.url=u.value; if(c) imp.caption=c.value; }
 function addShots(list){
   if(!imp||imp.busy) return; syncImportFields();
   let skipped=0;
@@ -410,38 +414,56 @@ function addShots(list){
     if(imp.files.length>=MAX_SHOTS){ skipped++; continue; }
     imp.files.push(f); imp.urls.push(URL.createObjectURL(f));
   }
+  imp.tab='shots';
   imp.error = skipped? `${skipped} fichier${skipped>1?'s':''} ignoré${skipped>1?'s':''} (pas une image, ou limite de ${MAX_SHOTS} captures).` : '';
   renderImporter();
 }
 async function runImport(){
   if(!imp||imp.busy) return;
   syncImportFields();
+  const link=imp.tab==='link';
   const url=imp.url.trim(), caption=imp.caption.trim();
   if(url && !safeUrl(url)){ imp.error="Ce lien ne semble pas valide : il doit commencer par https://"; renderImporter(); return; }
-  if(!url && !caption && !imp.files.length){ imp.error="Colle un lien, du texte ou ajoute au moins une capture d'écran."; renderImporter(); return; }
-  imp.busy=true; imp.error=''; imp.timedOut=false; imp.ctl=new AbortController(); renderImporter();
-  const ctl=imp.ctl;
-  const timer=setTimeout(()=>{ if(imp && imp.ctl===ctl){ imp.timedOut=true; ctl.abort(); } }, 45000);
+  if(link && !url){ imp.error="Colle le lien de la vidéo (dans TikTok : Partager → Copier le lien)."; renderImporter(); return; }
+  if(!link && !caption && !imp.files.length){ imp.error="Ajoute au moins une capture d'écran ou colle le texte de la recette."; renderImporter(); return; }
+  const ctl=new AbortController();
+  imp.busy=true; imp.error=''; imp.timedOut=false; imp.ctl=ctl; imp.started=Date.now(); renderImporter();
+  clearInterval(imp.tick);
+  imp.tick=setInterval(()=>{ const el=$('#i-elapsed'); if(el && imp) el.textContent=Math.round((Date.now()-imp.started)/1000)+' s'; },1000);
+  const limit = link ? 45000 : 90000;
+  const timer=setTimeout(()=>{ if(imp && imp.ctl===ctl){ imp.timedOut=true; ctl.abort(); } }, limit);
   try{
-    const fd=new FormData(); fd.append('url',url); fd.append('caption',caption);
-    for(const f of imp.files){ fd.append('images', await resizeImage(f,1600,.85), 'capture.jpg'); }
+    const fd=new FormData();
+    if(link){ fd.append('url',url); }
+    else{
+      fd.append('caption',caption); fd.append('source',url);
+      for(const f of imp.files){ fd.append('images', await resizeImage(f,2400,.9), 'capture.jpg'); }
+    }
+    if(ctl.signal.aborted) return;
     const res=await api('/api/import',{method:'POST', body:fd, signal:ctl.signal});
     if(!imp || imp.ctl!==ctl) return;
+    clearInterval(imp.tick);
     const notice = res.ai===false ? (res.notes || "Fiche pré-remplie : relis-la avant d'enregistrer.") : "Fiche rédigée par Claude : relis-la avant d'enregistrer." + (res.notes? ' '+res.notes : '');
     imp.busy=false;
-    openEditor({...blankDraft(), ...res.draft}, {notice});
+    const draft={...blankDraft(), ...res.draft};
+    closeImporter();                 // l'éditeur ne doit pas s'ouvrir derrière l'écran d'import
+    openEditor(draft, {notice});
   }catch(e){
     if(!imp || imp.ctl!==ctl) return;
+    clearInterval(imp.tick);
     imp.busy=false;
     if(e.name==='AbortError'){
-      imp.error = imp.timedOut ? "La vidéo met trop de temps à répondre. Ouvre-la, copie sa description et colle-la dans « Texte en plus »." : '';
-      imp.forceMore = imp.timedOut;
+      if(imp.timedOut){
+        if(link){ imp.tab='shots'; imp.error="La vidéo ne répond pas. Fais des captures de sa description et ajoute-les ici, ou colle le texte."; }
+        else imp.error="La lecture prend trop de temps. Essaie avec moins de captures, ou colle le texte de la recette.";
+      } else imp.error='';
+    } else if(link && (e.status===422 || e.status===0)){
+      imp.tab='shots';
+      imp.error = e.status===0 ? e.message : "Je n'ai pas pu lire cette vidéo. Fais des captures de sa description et ajoute-les ici, ou colle le texte.";
     } else {
       imp.error = e.message || "L'import a échoué. Réessaie.";
-      imp.forceMore = e.status===422;
     }
     renderImporter();
-    if(imp.forceMore) setTimeout(()=>$('#i-cap')?.focus(),60);
   }finally{ clearTimeout(timer); }
 }
 
@@ -452,7 +474,7 @@ function handleShare(){
   const all=[p.get('url'),p.get('text'),p.get('title')].filter(Boolean).join(' ');
   const m=all.match(/https?:\/\/[^\s"'<>]+/);
   history.replaceState(null,'','/');
-  if(!m){ if(all.trim()) openImporter({caption:all.trim()}); return; }
+  if(!m){ if(all.trim()) openImporter({tab:'shots', caption:all.trim()}); return; }
   openImporter({url:m[0], autoStart:true});
 }
 
@@ -468,7 +490,7 @@ function openAddMenu(){
 
 /* ---------- Événements ---------- */
 document.addEventListener('click', async ev=>{
-  const t=ev.target.closest('[data-act],[data-season],[data-cat],[data-fav],[data-open],[data-ing],[data-step],[data-pick],[data-rmshot]');
+  const t=ev.target.closest('[data-act],[data-season],[data-cat],[data-fav],[data-open],[data-ing],[data-step],[data-pick],[data-rmshot],[data-tab]');
   if(!t){ if(ev.target.id==='dlg') closeDialog(); return; }
   if(t.dataset.fav!==undefined){
     ev.stopPropagation();
@@ -478,6 +500,7 @@ document.addEventListener('click', async ev=>{
     catch(e){ r.favorite=!val; render(); if(det.id===r.id) renderDetail(); toast(e.message); }
     return;
   }
+  if(t.dataset.tab){ if(imp && !imp.busy){ syncImportFields(); imp.tab=t.dataset.tab; imp.error=''; renderImporter(); } return; }
   if(t.dataset.season){ ui.season=t.dataset.season; render(); return; }
   if(t.dataset.cat){ ui.cat=t.dataset.cat; render(); return; }
   if(t.dataset.open){ openDetail(t.dataset.open); return; }
@@ -501,9 +524,9 @@ document.addEventListener('click', async ev=>{
   else if(a==='close-editor'){ closeEditor(); }
   else if(a==='remove-photo'){ readEditor(); if(ed.previewUrl) URL.revokeObjectURL(ed.previewUrl); ed.photoFile=null; ed.previewUrl=null; ed.removePhoto=true; renderEditor(); }
   else if(a==='close-importer'){ closeImporter(); }
-  else if(a==='stop-import'){ if(imp){ const c=imp.ctl; imp.ctl=null; imp.busy=false; imp.error=''; c?.abort(); renderImporter(); } }
+  else if(a==='stop-import'){ if(imp){ const c=imp.ctl; imp.ctl=null; clearInterval(imp.tick); imp.busy=false; imp.error=''; c?.abort(); renderImporter(); } }
   else if(a==='import-manual'){ syncImportFields(); const cap=imp.caption.trim(); const cover=imp.files.at(-1)||null; const d={...blankDraft(), sourceUrl:imp.url.trim()};
-    openEditor(d,{photoFile:cover, notice: cap? 'Ton texte est dans les étapes : répartis-le entre ingrédients et étapes.':'', stepsText:cap}); }
+    closeImporter(); openEditor(d,{photoFile:cover, notice: cap? 'Ton texte est dans les étapes : répartis-le entre ingrédients et étapes.':'', stepsText:cap}); }
 });
 $('#btn-add').addEventListener('click', openAddMenu);
 $('#btn-fav').addEventListener('click', ()=>{ ui.fav=!ui.fav; render(); });
