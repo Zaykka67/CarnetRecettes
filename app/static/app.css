@@ -349,3 +349,10 @@ html,body{overflow-x:hidden}
 .acc-row .btn{flex:1;justify-content:center}
 #acc-pw-form{display:grid;gap:8px}
 .dialog{max-height:calc(100dvh - 40px);overflow-y:auto}
+
+.pw-wrap{position:relative;display:block}
+.pw-wrap .input{width:100%;padding-right:46px}
+.login .pw-wrap .input{padding-left:46px}
+.pw-eye{position:absolute;right:6px;top:50%;transform:translateY(-50%);width:36px;height:36px;border:0;background:transparent;color:var(--muted);border-radius:50%;display:grid;place-items:center;cursor:pointer}
+.pw-eye:hover{background:var(--soft);color:var(--ink)}
+.pw-eye svg{width:20px;height:20px}

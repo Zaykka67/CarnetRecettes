@@ -1,5 +1,5 @@
 // Service worker : l'appli s'ouvre même sans réseau, les recettes viennent du serveur.
-const CACHE = 'carnet-v9';
+const CACHE = 'carnet-v10';
 const SHELL = ['/', '/app.css', '/app.js', '/manifest.webmanifest', '/icons/icon-192.png'];
 
 self.addEventListener('install', e => {

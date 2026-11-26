@@ -338,6 +338,22 @@ function openWeekShopPicker(){
 }
 
 /* ---------- Connexion et comptes ---------- */
+const EYE='<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M2 12s3.6-7 10-7 10 7 10 7-3.6 7-10 7S2 12 2 12z"/><circle cx="12" cy="12" r="3"/></svg>';
+const EYE_OFF='<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 3l18 18"/><path d="M10.6 5.1A10.6 10.6 0 0 1 12 5c6.4 0 10 7 10 7a17 17 0 0 1-3.2 4.1M6.6 6.6A17 17 0 0 0 2 12s3.6 7 10 7a9.7 9.7 0 0 0 5.4-1.6"/><path d="M9.9 9.9a3 3 0 0 0 4.2 4.2"/></svg>';
+/* Ajoute un bouton « œil » à chaque champ mot de passe pour vérifier ce qu'on a tapé */
+function addEyes(root=document){
+  root.querySelectorAll('input[type=password]:not([data-eyed])').forEach(inp=>{
+    inp.dataset.eyed='1';
+    const wrap=document.createElement('div'); wrap.className='pw-wrap';
+    inp.parentNode.insertBefore(wrap, inp); wrap.appendChild(inp);
+    const b=document.createElement('button'); b.type='button'; b.className='pw-eye';
+    b.setAttribute('aria-label','Afficher le mot de passe'); b.innerHTML=EYE;
+    b.addEventListener('click', ()=>{ const show=inp.type==='password'; inp.type=show?'text':'password';
+      b.innerHTML=show?EYE_OFF:EYE; b.setAttribute('aria-label', show?'Masquer le mot de passe':'Afficher le mot de passe'); inp.focus(); });
+    wrap.appendChild(b);
+  });
+}
+addEyes();
 let loginMode='in';
 function setLoginMode(m){
   loginMode=m;
@@ -392,6 +408,7 @@ async function openAccount(){
     </div>
     <div class="formbar"><button class="btn" type="button" data-act="close-dlg">Fermer</button><button class="btn danger" type="button" data-act="acc-logout">Se déconnecter</button></div>`);
   $('#dlg-box').classList.add('wide');
+  addEyes($('#dlg-box'));
 }
 
 /* ---------- Liste ---------- */
