@@ -333,3 +333,19 @@ html,body{overflow-x:hidden}
 .pick-list .from{display:block;font-size:.76rem;color:var(--muted)}
 .entry .nm{-webkit-line-clamp:3;hyphens:auto;overflow-wrap:anywhere}
 @media (max-width:620px){.entry .th{display:none}.entry{padding:6px 4px 6px 8px}.slot{padding:6px}}
+
+/* ---- Comptes ---- */
+.avatar{width:38px;height:38px;border-radius:50%;border:0;background:var(--ink);color:var(--bg);font-weight:700;font-size:1rem;display:inline-grid;place-items:center;flex:none;text-transform:uppercase}
+.avatar[hidden]{display:none}
+.login .seg{margin:4px 0}
+.login .seg button{justify-content:center}
+.login .hint{font-size:.88rem;color:var(--muted);margin:0}
+.acc-email{font-weight:600;word-break:break-all}
+.acc-box{border:1px solid var(--line);border-radius:14px;padding:12px 14px;display:grid;gap:10px;background:var(--bg)}
+.acc-box h4{margin:0;font-size:.78rem;text-transform:uppercase;letter-spacing:.07em;color:var(--muted)}
+.invite-code{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:1.6rem;font-weight:700;letter-spacing:.12em;text-align:center;padding:6px 0;user-select:all}
+.acc-users{margin:0;padding:0;list-style:none;font-size:.88rem;color:var(--muted);display:grid;gap:2px;max-height:120px;overflow-y:auto}
+.acc-row{display:flex;gap:8px;flex-wrap:wrap}
+.acc-row .btn{flex:1;justify-content:center}
+#acc-pw-form{display:grid;gap:8px}
+.dialog{max-height:calc(100dvh - 40px);overflow-y:auto}

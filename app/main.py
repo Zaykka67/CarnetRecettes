@@ -1,7 +1,8 @@
 """Carnet de recettes — serveur FastAPI.
 
 - Stocke les recettes dans SQLite et les photos sur disque (dossier DATA_DIR).
-- Protège l'appli par un mot de passe unique (APP_PASSWORD).
+- Gère plusieurs comptes (e-mail + mot de passe). Chaque compte a ses recettes, ses menus et sa liste
+  de courses. Les nouveaux comptes se créent avec un code d'invitation donné par l'administrateur.
 - Importe une recette depuis un lien (TikTok, YouTube, Instagram, site web) :
   récupère la description et la miniature de la vidéo, puis demande à Claude
   (API Anthropic) d'en faire une fiche recette.
@@ -66,8 +67,7 @@ CATEGORIES = ["Apéro", "Entrée", "Plat", "Accompagnement", "Dessert", "Petit-d
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/131.0 Safari/537.36")
 
-if not APP_PASSWORD:
-    log.warning("APP_PASSWORD n'est pas défini : l'appli est accessible sans mot de passe.")
+OWNER_EMAIL = os.getenv("OWNER_EMAIL", "amandine.mutz766@gmail.com").strip().lower()
 if GEMINI_API_KEY:
     log.info("GEMINI_API_KEY présent : import par Gemini (vidéo + son + captures).")
 elif not ANTHROPIC_API_KEY:
@@ -95,6 +95,15 @@ with db() as _c:
         id TEXT PRIMARY KEY, key TEXT NOT NULL, name TEXT NOT NULL, qty REAL, unit TEXT NOT NULL DEFAULT '',
         aisle TEXT NOT NULL, recipes TEXT NOT NULL DEFAULT '[]', checked INTEGER NOT NULL DEFAULT 0,
         created_at INTEGER NOT NULL)""")
+    _c.execute("""CREATE TABLE IF NOT EXISTS users(
+        id TEXT PRIMARY KEY, email TEXT UNIQUE NOT NULL, pw TEXT NOT NULL DEFAULT '',
+        is_admin INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL)""")
+    _c.execute("CREATE TABLE IF NOT EXISTS settings(k TEXT PRIMARY KEY, v TEXT NOT NULL)")
+    # chaque recette, repas et article appartient à un compte
+    for _t in ("recipes", "menu", "shopping"):
+        if "user_id" not in [r[1] for r in _c.execute(f"PRAGMA table_info({_t})")]:
+            _c.execute(f"ALTER TABLE {_t} ADD COLUMN user_id TEXT")
+        _c.execute(f"CREATE INDEX IF NOT EXISTS {_t}_user ON {_t}(user_id)")
 
 
 def now_ms() -> int:
@@ -109,9 +118,9 @@ def row_to_recipe(row: sqlite3.Row) -> dict:
     return d
 
 
-def get_recipe(rid: str) -> dict | None:
+def get_recipe(rid: str, uid: str) -> dict | None:
     with db() as c:
-        row = c.execute("SELECT * FROM recipes WHERE id=?", (rid,)).fetchone()
+        row = c.execute("SELECT * FROM recipes WHERE id=? AND user_id=?", (rid, uid)).fetchone()
     return row_to_recipe(row) if row else None
 
 
@@ -225,21 +234,86 @@ def delete_photo(photo: dict | None) -> None:
 # --------------------------------------------------------------------------
 # Session
 # --------------------------------------------------------------------------
-def make_token() -> str:
-    exp = str(int(time.time()) + SESSION_DAYS * 86400)
-    sig = hmac.new(SECRET_KEY.encode(), exp.encode(), hashlib.sha256).hexdigest()
-    return f"{exp}.{sig}"
+def hash_pw(pw: str) -> str:
+    salt = os.urandom(16)
+    h = hashlib.scrypt(pw.encode(), salt=salt, n=2 ** 14, r=8, p=1, dklen=32)
+    return f"scrypt${salt.hex()}${h.hex()}"
 
 
-def is_authed(request: Request) -> bool:
-    if not APP_PASSWORD:
-        return True
-    tok = request.cookies.get(COOKIE, "")
-    exp, _, sig = tok.partition(".")
-    if not exp.isdigit() or int(exp) < time.time():
+def check_pw(pw: str, stored: str) -> bool:
+    try:
+        _, salt, h = stored.split("$")
+        test = hashlib.scrypt(pw.encode(), salt=bytes.fromhex(salt), n=2 ** 14, r=8, p=1, dklen=32)
+        return hmac.compare_digest(test.hex(), h)
+    except (ValueError, TypeError):
         return False
-    good = hmac.new(SECRET_KEY.encode(), exp.encode(), hashlib.sha256).hexdigest()
-    return hmac.compare_digest(sig, good)
+
+
+def make_token(uid: str) -> str:
+    exp = str(int(time.time()) + SESSION_DAYS * 86400)
+    sig = hmac.new(SECRET_KEY.encode(), f"{uid}.{exp}".encode(), hashlib.sha256).hexdigest()
+    return f"{uid}.{exp}.{sig}"
+
+
+def current_user(request: Request) -> sqlite3.Row | None:
+    parts = request.cookies.get(COOKIE, "").split(".")
+    if len(parts) != 3:
+        return None
+    uid, exp, sig = parts
+    if not exp.isdigit() or int(exp) < time.time():
+        return None
+    good = hmac.new(SECRET_KEY.encode(), f"{uid}.{exp}".encode(), hashlib.sha256).hexdigest()
+    if not hmac.compare_digest(sig, good):
+        return None
+    with db() as c:
+        return c.execute("SELECT * FROM users WHERE id=?", (uid,)).fetchone()
+
+
+def new_invite_code() -> str:
+    alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"   # sans 0/O ni 1/I
+    code = "".join(alphabet[b % len(alphabet)] for b in os.urandom(8))
+    return code[:4] + "-" + code[4:]
+
+
+def get_setting(k: str) -> str | None:
+    with db() as c:
+        row = c.execute("SELECT v FROM settings WHERE k=?", (k,)).fetchone()
+    return row["v"] if row else None
+
+
+def set_setting(k: str, v: str) -> None:
+    with db() as c:
+        c.execute("INSERT INTO settings(k, v) VALUES (?, ?) ON CONFLICT(k) DO UPDATE SET v=excluded.v", (k, v))
+
+
+def migrate_accounts() -> None:
+    """Premier démarrage avec les comptes : les données existantes vont au compte du propriétaire,
+    avec l'ancien mot de passe de l'appli (APP_PASSWORD)."""
+    with db() as c:
+        n_users = c.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+        orphans = sum(c.execute(f"SELECT COUNT(*) FROM {t} WHERE user_id IS NULL").fetchone()[0]
+                      for t in ("recipes", "menu", "shopping"))
+        if n_users == 0 and (orphans or APP_PASSWORD):
+            c.execute("INSERT INTO users(id, email, pw, is_admin, created_at) VALUES (?,?,?,1,?)",
+                      (uuid.uuid4().hex[:12], OWNER_EMAIL, hash_pw(APP_PASSWORD) if APP_PASSWORD else "", now_ms()))
+            log.info("Compte %s créé (administrateur) avec le mot de passe actuel de l'appli", OWNER_EMAIL)
+        admin = c.execute("SELECT id, email FROM users WHERE is_admin=1 ORDER BY created_at LIMIT 1").fetchone()
+        if admin and orphans:
+            for t in ("recipes", "menu", "shopping"):
+                c.execute(f"UPDATE {t} SET user_id=? WHERE user_id IS NULL", (admin["id"],))
+            log.info("%s élément(s) existant(s) rattaché(s) au compte %s", orphans, admin["email"])
+    if not get_setting("invite_code"):
+        set_setting("invite_code", new_invite_code())
+
+
+migrate_accounts()
+EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+
+
+def set_session(resp: Response, request: Request, uid: str) -> None:
+    secure = request.headers.get("x-forwarded-proto", request.url.scheme) == "https"
+    resp.set_cookie(COOKIE, make_token(uid), max_age=SESSION_DAYS * 86400, httponly=True,
+                    secure=secure, samesite="lax", path="/")
 
 
 # --------------------------------------------------------------------------
@@ -247,35 +321,81 @@ def is_authed(request: Request) -> bool:
 # --------------------------------------------------------------------------
 app = FastAPI(title="Carnet de recettes", docs_url=None, redoc_url=None)
 
-PUBLIC_API = {"/api/login", "/api/config"}
+PUBLIC_API = {"/api/login", "/api/signup", "/api/logout", "/api/config"}
 
 
 @app.middleware("http")
 async def auth_mw(request: Request, call_next):
     p = request.url.path
     protected = (p.startswith("/api/") and p not in PUBLIC_API) or p.startswith("/photos/")
-    if protected and not is_authed(request):
-        return JSONResponse({"detail": "Connexion requise."}, status_code=401)
+    if protected:
+        user = current_user(request)
+        if not user:
+            return JSONResponse({"detail": "Connexion requise."}, status_code=401)
+        request.state.uid = user["id"]
+        request.state.user = user
     return await call_next(request)
+
+
+def uid_of(request: Request) -> str:
+    return request.state.uid
 
 
 @app.get("/api/config")
 async def config(request: Request):
     provider = "gemini" if GEMINI_API_KEY else ("claude" if ANTHROPIC_API_KEY else "")
-    return {"ai": bool(provider), "provider": provider, "ocr": OCR_AVAILABLE, "auth": bool(APP_PASSWORD), "loggedIn": is_authed(request)}
+    user = current_user(request)
+    with db() as c:
+        has_users = c.execute("SELECT COUNT(*) FROM users").fetchone()[0] > 0
+    return {"ai": bool(provider), "provider": provider, "ocr": OCR_AVAILABLE, "auth": True,
+            "loggedIn": bool(user), "email": user["email"] if user else None,
+            "isAdmin": bool(user and user["is_admin"]), "firstAccount": not has_users}
 
 
 @app.post("/api/login")
 async def login(request: Request):
     body = await request.json()
+    email = _s(body.get("email"), 200).lower()
     pwd = str(body.get("password", ""))
-    if not APP_PASSWORD or not hmac.compare_digest(pwd.encode(), APP_PASSWORD.encode()):
-        await asyncio.sleep(1.5)
-        raise HTTPException(401, "Mot de passe incorrect.")
-    resp = JSONResponse({"ok": True})
-    secure = request.headers.get("x-forwarded-proto", request.url.scheme) == "https"
-    resp.set_cookie(COOKIE, make_token(), max_age=SESSION_DAYS * 86400, httponly=True,
-                    secure=secure, samesite="lax", path="/")
+    with db() as c:
+        user = c.execute("SELECT * FROM users WHERE email=?", (email,)).fetchone()
+    if not user or not user["pw"] or not check_pw(pwd, user["pw"]):
+        await asyncio.sleep(1.2)
+        raise HTTPException(401, "E-mail ou mot de passe incorrect.")
+    resp = JSONResponse({"ok": True, "email": user["email"]})
+    set_session(resp, request, user["id"])
+    return resp
+
+
+@app.post("/api/signup")
+async def signup(request: Request):
+    body = await request.json()
+    email = _s(body.get("email"), 200).lower()
+    pwd = str(body.get("password", ""))
+    code = _s(body.get("code"), 20).upper().replace(" ", "")
+    if not EMAIL_RE.match(email):
+        raise HTTPException(400, "Cette adresse e-mail n'est pas valide.")
+    if len(pwd) < 6:
+        raise HTTPException(400, "Choisis un mot de passe d'au moins 6 caractères.")
+    with db() as c:
+        n_users = c.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+        existing = c.execute("SELECT * FROM users WHERE email=?", (email,)).fetchone()
+        if existing and existing["pw"]:
+            raise HTTPException(409, "Un compte existe déjà avec cet e-mail. Connecte-toi.")
+        invite = (get_setting("invite_code") or "").replace("-", "")
+        if n_users > 0 and not existing and code.replace("-", "") != invite:
+            await asyncio.sleep(1.2)
+            raise HTTPException(403, "Code d'invitation incorrect. Demande-le à la personne qui t'a invité.")
+        if existing:          # compte propriétaire créé sans mot de passe : on le complète
+            uid = existing["id"]
+            c.execute("UPDATE users SET pw=? WHERE id=?", (hash_pw(pwd), uid))
+        else:
+            uid = uuid.uuid4().hex[:12]
+            c.execute("INSERT INTO users(id, email, pw, is_admin, created_at) VALUES (?,?,?,?,?)",
+                      (uid, email, hash_pw(pwd), 1 if n_users == 0 else 0, now_ms()))
+    log.info("Nouveau compte : %s", email)
+    resp = JSONResponse({"ok": True, "email": email})
+    set_session(resp, request, uid)
     return resp
 
 
@@ -286,11 +406,46 @@ async def logout():
     return resp
 
 
+@app.get("/api/account")
+async def account(request: Request):
+    u = request.state.user
+    out = {"email": u["email"], "isAdmin": bool(u["is_admin"])}
+    if u["is_admin"]:
+        with db() as c:
+            out["users"] = [r["email"] for r in c.execute("SELECT email FROM users ORDER BY created_at")]
+        out["inviteCode"] = get_setting("invite_code")
+    return out
+
+
+@app.post("/api/account/password")
+async def change_password(request: Request):
+    body = await request.json()
+    u = request.state.user
+    if not check_pw(str(body.get("current", "")), u["pw"]):
+        await asyncio.sleep(1)
+        raise HTTPException(400, "Le mot de passe actuel est incorrect.")
+    new = str(body.get("new", ""))
+    if len(new) < 6:
+        raise HTTPException(400, "Choisis un mot de passe d'au moins 6 caractères.")
+    with db() as c:
+        c.execute("UPDATE users SET pw=? WHERE id=?", (hash_pw(new), u["id"]))
+    return {"ok": True}
+
+
+@app.post("/api/account/invite")
+async def regenerate_invite(request: Request):
+    if not request.state.user["is_admin"]:
+        raise HTTPException(403, "Réservé à l'administrateur.")
+    code = new_invite_code()
+    set_setting("invite_code", code)
+    return {"inviteCode": code}
+
+
 # ---- Recettes ----------------------------------------------------------------
 @app.get("/api/recipes")
-async def list_recipes():
+async def list_recipes(request: Request):
     with db() as c:
-        rows = c.execute("SELECT * FROM recipes ORDER BY created_at DESC").fetchall()
+        rows = c.execute("SELECT * FROM recipes WHERE user_id=? ORDER BY created_at DESC", (uid_of(request),)).fetchall()
     return [row_to_recipe(r) for r in rows]
 
 
@@ -299,27 +454,28 @@ async def create_recipe(request: Request):
     data = clean_recipe(await request.json())
     rid, ts = uuid.uuid4().hex[:12], now_ms()
     with db() as c:
-        c.execute("INSERT INTO recipes VALUES (?,?,?,?)", (rid, json.dumps(data, ensure_ascii=False), ts, ts))
-    return get_recipe(rid)
+        c.execute("INSERT INTO recipes(id, data, created_at, updated_at, user_id) VALUES (?,?,?,?,?)",
+                  (rid, json.dumps(data, ensure_ascii=False), ts, ts, uid_of(request)))
+    return get_recipe(rid, uid_of(request))
 
 
 @app.put("/api/recipes/{rid}")
 async def replace_recipe(rid: str, request: Request):
-    old = get_recipe(rid)
+    old = get_recipe(rid, uid_of(request))
     if not old:
         raise HTTPException(404, "Recette introuvable.")
     data = clean_recipe(await request.json())
     if (old.get("photo") or {}).get("id") != (data.get("photo") or {}).get("id"):
         delete_photo(old.get("photo"))
     with db() as c:
-        c.execute("UPDATE recipes SET data=?, updated_at=? WHERE id=?",
-                  (json.dumps(data, ensure_ascii=False), now_ms(), rid))
-    return get_recipe(rid)
+        c.execute("UPDATE recipes SET data=?, updated_at=? WHERE id=? AND user_id=?",
+                  (json.dumps(data, ensure_ascii=False), now_ms(), rid, uid_of(request)))
+    return get_recipe(rid, uid_of(request))
 
 
 @app.patch("/api/recipes/{rid}")
 async def patch_recipe(rid: str, request: Request):
-    old = get_recipe(rid)
+    old = get_recipe(rid, uid_of(request))
     if not old:
         raise HTTPException(404, "Recette introuvable.")
     body = await request.json()
@@ -327,19 +483,20 @@ async def patch_recipe(rid: str, request: Request):
         old["favorite"] = bool(body["favorite"])
     data = clean_recipe(old)
     with db() as c:
-        c.execute("UPDATE recipes SET data=?, updated_at=? WHERE id=?",
-                  (json.dumps(data, ensure_ascii=False), now_ms(), rid))
-    return get_recipe(rid)
+        c.execute("UPDATE recipes SET data=?, updated_at=? WHERE id=? AND user_id=?",
+                  (json.dumps(data, ensure_ascii=False), now_ms(), rid, uid_of(request)))
+    return get_recipe(rid, uid_of(request))
 
 
 @app.delete("/api/recipes/{rid}")
-async def delete_recipe(rid: str):
-    old = get_recipe(rid)
+async def delete_recipe(rid: str, request: Request):
+    uid = uid_of(request)
+    old = get_recipe(rid, uid)
     if old:
         delete_photo(old.get("photo"))
         with db() as c:
-            c.execute("DELETE FROM recipes WHERE id=?", (rid,))
-            c.execute("DELETE FROM menu WHERE recipe_id=?", (rid,))
+            c.execute("DELETE FROM recipes WHERE id=? AND user_id=?", (rid, uid))
+            c.execute("DELETE FROM menu WHERE recipe_id=? AND user_id=?", (rid, uid))
     return Response(status_code=204)
 
 
@@ -347,9 +504,9 @@ async def delete_recipe(rid: str):
 AISLE_ORDER = [a for a, _ in AISLES] + ["Autres"]
 
 
-def shopping_list() -> list[dict]:
+def shopping_list(uid: str) -> list[dict]:
     with db() as c:
-        rows = c.execute("SELECT * FROM shopping ORDER BY created_at").fetchall()
+        rows = c.execute("SELECT * FROM shopping WHERE user_id=? ORDER BY created_at", (uid,)).fetchall()
     items = []
     for r in rows:
         q, u = display_qty(r["qty"], r["unit"])
@@ -359,14 +516,14 @@ def shopping_list() -> list[dict]:
     return items
 
 
-def add_to_shopping(c: sqlite3.Connection, name: str, qty, unit: str, recipe: str = "") -> None:
+def add_to_shopping(c: sqlite3.Connection, uid: str, name: str, qty, unit: str, recipe: str = "") -> None:
     name = _s(name, 200)
     if not name:
         return
     qty = _num(qty)
     bq, bu = to_base(qty, _s(unit, 30))
     k = key_of(name) + "|" + bu
-    row = c.execute("SELECT * FROM shopping WHERE key=? AND checked=0", (k,)).fetchone()
+    row = c.execute("SELECT * FROM shopping WHERE key=? AND checked=0 AND user_id=?", (k, uid)).fetchone()
     if row:
         recipes = json.loads(row["recipes"])
         if recipe and recipe not in recipes:
@@ -376,14 +533,15 @@ def add_to_shopping(c: sqlite3.Connection, name: str, qty, unit: str, recipe: st
             new_q = (new_q or 0) + bq
         c.execute("UPDATE shopping SET qty=?, recipes=? WHERE id=?", (new_q, json.dumps(recipes, ensure_ascii=False), row["id"]))
     else:
-        c.execute("INSERT INTO shopping VALUES (?,?,?,?,?,?,?,0,?)",
+        c.execute("INSERT INTO shopping(id, key, name, qty, unit, aisle, recipes, checked, created_at, user_id) "
+                  "VALUES (?,?,?,?,?,?,?,0,?,?)",
                   (uuid.uuid4().hex[:12], k, name, bq, bu, aisle_of(name),
-                   json.dumps([recipe] if recipe else [], ensure_ascii=False), now_ms()))
+                   json.dumps([recipe] if recipe else [], ensure_ascii=False), now_ms(), uid))
 
 
 @app.get("/api/shopping")
-async def get_shopping():
-    return shopping_list()
+async def get_shopping(request: Request):
+    return shopping_list(uid_of(request))
 
 
 @app.post("/api/shopping/add")
@@ -393,8 +551,9 @@ async def shopping_add(request: Request):
     items = [i for i in (body.get("items") or [])[:100] if isinstance(i, dict)]
     with db() as c:
         for i in items:
-            add_to_shopping(c, i.get("name"), i.get("qty"), i.get("unit") or "", _s(i.get("recipe"), 160) or recipe)
-    return shopping_list()
+            add_to_shopping(c, uid_of(request), i.get("name"), i.get("qty"), i.get("unit") or "",
+                            _s(i.get("recipe"), 160) or recipe)
+    return shopping_list(uid_of(request))
 
 
 @app.post("/api/shopping/item")
@@ -405,23 +564,24 @@ async def shopping_item(request: Request):
         raise HTTPException(400, "Écris le nom de l'article.")
     ing = parse_ingredient(text)
     with db() as c:
-        add_to_shopping(c, ing["name"], ing["qty"], ing["unit"])
-    return shopping_list()
+        add_to_shopping(c, uid_of(request), ing["name"], ing["qty"], ing["unit"])
+    return shopping_list(uid_of(request))
 
 
 @app.patch("/api/shopping/{iid}")
 async def shopping_check(iid: str, request: Request):
     body = await request.json()
     with db() as c:
-        c.execute("UPDATE shopping SET checked=? WHERE id=?", (1 if body.get("checked") else 0, iid))
-    return shopping_list()
+        c.execute("UPDATE shopping SET checked=? WHERE id=? AND user_id=?",
+                  (1 if body.get("checked") else 0, iid, uid_of(request)))
+    return shopping_list(uid_of(request))
 
 
 @app.delete("/api/shopping/{iid}")
-async def shopping_delete(iid: str):
+async def shopping_delete(iid: str, request: Request):
     with db() as c:
-        c.execute("DELETE FROM shopping WHERE id=?", (iid,))
-    return shopping_list()
+        c.execute("DELETE FROM shopping WHERE id=? AND user_id=?", (iid, uid_of(request)))
+    return shopping_list(uid_of(request))
 
 
 @app.post("/api/shopping/clear")
@@ -429,10 +589,10 @@ async def shopping_clear(request: Request):
     mode = (await request.json()).get("mode")
     with db() as c:
         if mode == "all":
-            c.execute("DELETE FROM shopping")
+            c.execute("DELETE FROM shopping WHERE user_id=?", (uid_of(request),))
         else:
-            c.execute("DELETE FROM shopping WHERE checked=1")
-    return shopping_list()
+            c.execute("DELETE FROM shopping WHERE checked=1 AND user_id=?", (uid_of(request),))
+    return shopping_list(uid_of(request))
 
 
 # ---- Menus de la semaine ----------------------------------------------------------
@@ -441,11 +601,12 @@ DAY_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
 
 @app.get("/api/menu")
-async def get_menu(start: str, end: str):
+async def get_menu(start: str, end: str, request: Request):
     if not (DAY_RE.match(start) and DAY_RE.match(end)):
         raise HTTPException(400, "Dates invalides.")
     with db() as c:
-        rows = c.execute("SELECT * FROM menu WHERE day BETWEEN ? AND ? ORDER BY day, meal, created_at", (start, end)).fetchall()
+        rows = c.execute("SELECT * FROM menu WHERE user_id=? AND day BETWEEN ? AND ? ORDER BY day, meal, created_at",
+                         (uid_of(request), start, end)).fetchall()
     return [{"id": r["id"], "day": r["day"], "meal": r["meal"], "recipeId": r["recipe_id"], "text": r["text"],
              "servings": r["servings"]} for r in rows]
 
@@ -458,13 +619,14 @@ async def add_menu(request: Request):
         raise HTTPException(400, "Choisis un jour et un repas.")
     rid = _s(b.get("recipeId"), 40) or None
     text = _s(b.get("text"), 120)
-    if rid and not get_recipe(rid):
+    if rid and not get_recipe(rid, uid_of(request)):
         raise HTTPException(404, "Recette introuvable.")
     if not rid and not text:
         raise HTTPException(400, "Choisis une recette ou écris ce que tu manges.")
     mid = uuid.uuid4().hex[:12]
     with db() as c:
-        c.execute("INSERT INTO menu VALUES (?,?,?,?,?,?,?)", (mid, day, meal, rid, text, _int(b.get("servings")), now_ms()))
+        c.execute("INSERT INTO menu(id, day, meal, recipe_id, text, servings, created_at, user_id) VALUES (?,?,?,?,?,?,?,?)",
+                  (mid, day, meal, rid, text, _int(b.get("servings")), now_ms(), uid_of(request)))
     return {"id": mid}
 
 
@@ -472,7 +634,7 @@ async def add_menu(request: Request):
 async def edit_menu(mid: str, request: Request):
     b = await request.json()
     with db() as c:
-        row = c.execute("SELECT * FROM menu WHERE id=?", (mid,)).fetchone()
+        row = c.execute("SELECT * FROM menu WHERE id=? AND user_id=?", (mid, uid_of(request))).fetchone()
         if not row:
             raise HTTPException(404, "Repas introuvable.")
         day = b.get("day") if DAY_RE.match(str(b.get("day", ""))) else row["day"]
@@ -483,9 +645,9 @@ async def edit_menu(mid: str, request: Request):
 
 
 @app.delete("/api/menu/{mid}")
-async def delete_menu(mid: str):
+async def delete_menu(mid: str, request: Request):
     with db() as c:
-        c.execute("DELETE FROM menu WHERE id=?", (mid,))
+        c.execute("DELETE FROM menu WHERE id=? AND user_id=?", (mid, uid_of(request)))
     return Response(status_code=204)
 
 

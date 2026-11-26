@@ -14,10 +14,16 @@ carnet-recettes/
 └── lancer-local.bat         test en local sur Windows
 ```
 
+## Comptes
+
+Chaque personne a son compte (e-mail + mot de passe) avec ses propres recettes, menus et liste de courses.
+Au premier démarrage de cette version, les données existantes sont rattachées au compte `OWNER_EMAIL`, avec `APP_PASSWORD` comme mot de passe. Ce compte est administrateur : dans « Mon compte », il voit le **code d'invitation** à donner aux nouvelles personnes (« Créer un compte » dans l'appli) et peut en générer un nouveau.
+
 ## Variables d'environnement
 
 | Variable | Rôle |
 |---|---|
+| `OWNER_EMAIL` | Facultatif. E-mail du compte administrateur créé au premier démarrage avec les comptes (par défaut amandine.mutz766@gmail.com). |
 | `APP_PASSWORD` | Mot de passe demandé à l'ouverture. **Obligatoire en ligne**, sinon n'importe qui peut lire ton carnet et consommer ta clé API. |
 | `SECRET_KEY` | Longue chaîne aléatoire qui signe la session (tu restes connecté 1 an). Génère-la avec `openssl rand -hex 32`. |
 | `GEMINI_API_KEY` | **Recommandé, gratuit.** Clé de l'IA Gemini de Google (aistudio.google.com → Get API key). Gemini regarde la vidéo avec le son, lit les captures et rédige la fiche. |

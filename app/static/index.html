@@ -38,6 +38,7 @@
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><path d="M12 5v14M5 12h14"/></svg>
       Ajouter
     </button>
+    <button class="avatar" id="btn-account" type="button" aria-label="Mon compte" hidden><span id="acc-initial">?</span></button>
   </div>
 </header>
 
@@ -73,11 +74,19 @@
   <form id="login-form" novalidate>
     <img class="logo" src="/icons/icon-192.png" alt="">
     <h1>Carnet de recettes</h1>
-    <p>Entre le mot de passe pour ouvrir ton carnet.</p>
-    <label for="pwd" class="sr" style="position:absolute;left:-9999px">Mot de passe</label>
+    <div class="seg" role="tablist" aria-label="Connexion ou création de compte">
+      <button type="button" data-login-tab="in" aria-pressed="true">Connexion</button>
+      <button type="button" data-login-tab="up" aria-pressed="false">Créer un compte</button>
+    </div>
+    <label for="email" style="position:absolute;left:-9999px">Adresse e-mail</label>
+    <input class="input" id="email" type="email" inputmode="email" autocomplete="username" placeholder="Adresse e-mail">
+    <label for="pwd" style="position:absolute;left:-9999px">Mot de passe</label>
     <input class="input" id="pwd" type="password" autocomplete="current-password" placeholder="Mot de passe">
-    <button class="btn primary" type="submit" id="login-btn">Ouvrir</button>
+    <label for="code" style="position:absolute;left:-9999px">Code d'invitation</label>
+    <input class="input" id="code" autocomplete="off" autocapitalize="characters" placeholder="Code d'invitation (ex. GCEA-8C69)" hidden>
+    <button class="btn primary" type="submit" id="login-btn">Se connecter</button>
     <p id="login-err" style="color:var(--danger)" hidden></p>
+    <p id="login-hint" class="hint"></p>
   </form>
 </div>
 

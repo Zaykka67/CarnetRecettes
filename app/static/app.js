@@ -102,14 +102,14 @@ async function resizeImage(file, max=1600, q=.85){
 /* ---------- Serveur ---------- */
 let cfg={ai:false, auth:false, loggedIn:true};
 let recipes=[], loaded=false, offline=false;
-const CACHE_KEY='carnet-cache-v1';
+let CACHE_KEY='carnet-cache-v1';
 
 class ApiError extends Error{ constructor(status,msg){ super(msg); this.status=status; } }
 async function api(path, opts={}){
   let r;
   try{ r=await fetch(path,{credentials:'same-origin',...opts}); }
   catch(e){ if(e.name==='AbortError') throw e; throw new ApiError(0,'Pas de connexion internet.'); }
-  if(r.status===401 && path!=='/api/login'){ showLogin(); throw new ApiError(401,'Connexion requise.'); }
+  if(r.status===401 && path!=='/api/login' && path!=='/api/signup'){ showLogin(); throw new ApiError(401,'Connexion requise.'); }
   if(!r.ok){ let msg=''; try{ msg=(await r.json()).detail; }catch{} throw new ApiError(r.status, typeof msg==='string'&&msg ? msg : 'Une erreur est survenue ('+r.status+').'); }
   return r.status===204 ? null : r.json();
 }
@@ -130,7 +130,7 @@ function upsertLocal(rec){ const i=recipes.findIndex(r=>r.id===rec.id); if(i>=0)
 
 /* ---------- Liste de courses ---------- */
 let shop=[];
-const SHOP_KEY='carnet-courses-v1';
+let SHOP_KEY='carnet-courses-v1';
 const PANTRY=['sel','poivre','eau','sel et poivre','sel, poivre','fleur de sel'];
 async function loadShop(){
   try{ shop=await api('/api/shopping'); try{ localStorage.setItem(SHOP_KEY, JSON.stringify(shop)); }catch{} }
@@ -337,19 +337,62 @@ function openWeekShopPicker(){
   renderShopPicker();
 }
 
-/* ---------- Connexion ---------- */
-function showLogin(){ $('#login').hidden=false; setTimeout(()=>$('#pwd').focus(),50); }
+/* ---------- Connexion et comptes ---------- */
+let loginMode='in';
+function setLoginMode(m){
+  loginMode=m;
+  document.querySelectorAll('[data-login-tab]').forEach(b=>b.setAttribute('aria-pressed', b.dataset.loginTab===m));
+  const first=cfg.firstAccount;
+  $('#code').hidden = m!=='up' || first;
+  $('#pwd').autocomplete = m==='up' ? 'new-password' : 'current-password';
+  $('#pwd').placeholder = m==='up' ? 'Mot de passe (6 caractères minimum)' : 'Mot de passe';
+  $('#login-btn').textContent = m==='up' ? 'Créer mon compte' : 'Se connecter';
+  $('#login-hint').textContent = m==='up'
+    ? (first ? "Premier compte de l'appli : il en sera l'administrateur." : "Demande le code d'invitation à la personne qui utilise déjà l'appli.")
+    : '';
+  $('#login-err').hidden=true;
+}
+function showLogin(){ $('#login').hidden=false; setLoginMode(cfg.firstAccount?'up':loginMode); setTimeout(()=>$('#email').focus(),50); }
 $('#login-form').addEventListener('submit', async e=>{
   e.preventDefault();
-  const btn=$('#login-btn'), err=$('#login-err');
-  btn.disabled=true; btn.textContent='Vérification…'; err.hidden=true;
+  const btn=$('#login-btn'), err=$('#login-err'), label=btn.textContent;
+  const body={email:$('#email').value.trim(), password:$('#pwd').value, code:$('#code').value.trim()};
+  if(!body.email || !body.password){ err.textContent='Remplis ton e-mail et ton mot de passe.'; err.hidden=false; return; }
+  btn.disabled=true; btn.textContent= loginMode==='up' ? 'Création…' : 'Vérification…'; err.hidden=true;
   try{
-    await api('/api/login', jsonOpts('POST',{password:$('#pwd').value}));
-    $('#login').hidden=true; $('#pwd').value='';
-    await loadRecipes(); loadShop(); handleShare();
-  }catch(ex){ err.textContent=ex.message||'Connexion impossible.'; err.hidden=false; }
-  finally{ btn.disabled=false; btn.textContent='Ouvrir'; }
+    await api(loginMode==='up' ? '/api/signup' : '/api/login', jsonOpts('POST', body));
+    location.reload();          // repart proprement avec les données du compte
+  }catch(ex){ err.textContent=ex.message||'Connexion impossible.'; err.hidden=false; btn.disabled=false; btn.textContent=label; }
 });
+
+async function openAccount(){
+  openDialog(`<h3>Mon compte</h3><p>Chargement…</p>`);
+  let acc;
+  try{ acc=await api('/api/account'); }catch(e){ closeDialog(); toast(e.message); return; }
+  openDialog(`<h3>Mon compte</h3>
+    <div class="acc-email">${esc(acc.email)}${acc.isAdmin?' <span class="pill" style="--c:var(--accent)">Administrateur</span>':''}</div>
+    ${acc.isAdmin?`<div class="acc-box">
+      <h4>Inviter quelqu'un</h4>
+      <p style="margin:0;font-size:.9rem">Donne ce code à la personne. Dans l'appli, elle choisit « Créer un compte » et le saisit.</p>
+      <div class="invite-code" id="acc-code">${esc(acc.inviteCode||'')}</div>
+      <div class="acc-row"><button class="btn" type="button" data-act="acc-share">Envoyer le code</button><button class="btn" type="button" data-act="acc-newcode">Nouveau code</button></div>
+      <h4>Comptes (${acc.users.length})</h4>
+      <ul class="acc-users">${acc.users.map(u=>`<li>${esc(u)}</li>`).join('')}</ul>
+    </div>`:''}
+    <div class="acc-box">
+      <h4>Changer de mot de passe</h4>
+      <form id="acc-pw-form" novalidate>
+        <label for="acc-cur" style="position:absolute;left:-9999px">Mot de passe actuel</label>
+        <input class="input" id="acc-cur" type="password" autocomplete="current-password" placeholder="Mot de passe actuel">
+        <label for="acc-new" style="position:absolute;left:-9999px">Nouveau mot de passe</label>
+        <input class="input" id="acc-new" type="password" autocomplete="new-password" placeholder="Nouveau mot de passe">
+        <button class="btn" type="submit">Enregistrer le mot de passe</button>
+        <p id="acc-pw-msg" class="hint" hidden></p>
+      </form>
+    </div>
+    <div class="formbar"><button class="btn" type="button" data-act="close-dlg">Fermer</button><button class="btn danger" type="button" data-act="acc-logout">Se déconnecter</button></div>`);
+  $('#dlg-box').classList.add('wide');
+}
 
 /* ---------- Liste ---------- */
 const ui={season:'all', cat:'all', q:'', fav:false};
@@ -703,6 +746,7 @@ function openAddMenu(){
 
 /* ---------- Événements ---------- */
 document.addEventListener('click', async ev=>{
+  const lt=ev.target.closest('[data-login-tab]'); if(lt){ setLoginMode(lt.dataset.loginTab); return; }
   const t=ev.target.closest('[data-act],[data-season],[data-cat],[data-fav],[data-open],[data-ing],[data-step],[data-pick],[data-rmshot],[data-tab],[data-pick-ing],[data-shop],[data-shop-rm],[data-slot],[data-slot-tab],[data-slot-recipe],[data-menu-rm],[data-menu-open],[data-plan-day],[data-plan-meal]');
   if(!t){ if(ev.target.id==='dlg') closeDialog(); return; }
   if(t.dataset.fav!==undefined){
@@ -739,6 +783,11 @@ document.addEventListener('click', async ev=>{
   if(a==='import'){ closeDialog(); openImporter(); }
   else if(a==='manual'){ closeDialog(); openEditor(blankDraft()); setTimeout(()=>$('#f-title')?.focus(),60); }
   else if(a==='close-dlg'){ closeDialog(); }
+  else if(a==='acc-logout'){ try{ await api('/api/logout',{method:'POST'}); }catch{} try{ localStorage.removeItem(CACHE_KEY); localStorage.removeItem(SHOP_KEY); }catch{} location.reload(); }
+  else if(a==='acc-newcode'){ try{ const r=await api('/api/account/invite',{method:'POST'}); $('#acc-code').textContent=r.inviteCode; toast("Nouveau code créé : l'ancien ne marche plus"); }catch(e){ toast(e.message); } }
+  else if(a==='acc-share'){ const code=$('#acc-code').textContent, text=`Je t'invite sur mon carnet de recettes : ${location.origin}\nTouche « Créer un compte » et saisis le code d'invitation : ${code}`;
+    if(navigator.share){ try{ await navigator.share({title:'Carnet de recettes', text}); return; }catch(e){ if(e.name==='AbortError') return; } }
+    try{ await navigator.clipboard.writeText(text); toast('Invitation copiée : colle-la dans un SMS'); }catch{ toast('Copie impossible : note le code affiché.'); } }
   else if(a==='add-shop'){ openShopPicker(); }
   else if(a==='add-plan'){ openPlanPicker(); }
   else if(a==='plan-prev'||a==='plan-next'){ planPick.start=addDays(planPick.start, a==='plan-next'?7:-7); const wd=(new Date(planPick.day+'T12:00:00').getDay()+6)%7; planPick.day=isoDay(addDays(planPick.start, wd)); renderPlanPicker(); }
@@ -778,6 +827,7 @@ document.addEventListener('click', async ev=>{
 $('#btn-add').addEventListener('click', openAddMenu);
 $('#btn-shop').addEventListener('click', openShopping);
 $('#btn-menu').addEventListener('click', openMenu);
+$('#btn-account').addEventListener('click', openAccount);
 $('#btn-fav').addEventListener('click', ()=>{ ui.fav=!ui.fav; render(); });
 $('#q').addEventListener('input', e=>{ ui.q=e.target.value; render(); });
 document.addEventListener('input', e=>{ if(e.target.id==='slot-q'){ slotPick.q=e.target.value; renderSlotPicker(); } });
@@ -790,6 +840,10 @@ document.addEventListener('submit', e=>{
   if(e.target.id==='import-form'){ e.preventDefault(); runImport(); }
   if(e.target.id==='slot-free-form'){ e.preventDefault(); const v=$('#slot-free').value.trim(); if(!v) return;
     addMenuEntry({day:slotPick.day, meal:slotPick.meal, text:v}).then(ok=>{ if(ok) closeDialog(); }); }
+  if(e.target.id==='acc-pw-form'){ e.preventDefault(); const msg=$('#acc-pw-msg');
+    api('/api/account/password', jsonOpts('POST',{current:$('#acc-cur').value, new:$('#acc-new').value}))
+      .then(()=>{ msg.style.color='var(--accent)'; msg.textContent='Mot de passe modifié.'; msg.hidden=false; $('#acc-cur').value=''; $('#acc-new').value=''; })
+      .catch(err=>{ msg.style.color='var(--danger)'; msg.textContent=err.message; msg.hidden=false; }); }
   if(e.target.id==='shop-add-form'){ e.preventDefault(); const v=$('#shop-new').value.trim(); if(!v) return;
     api('/api/shopping/item', jsonOpts('POST',{text:v})).then(l=>{ setShop(l); setTimeout(()=>$('#shop-new')?.focus(),30); }).catch(err=>toast(err.message)); }
 });
@@ -825,7 +879,10 @@ if('serviceWorker' in navigator){ window.addEventListener('load', ()=>navigator.
 render();
 (async()=>{
   try{ cfg=await api('/api/config'); }catch{ cfg={ai:false, auth:false, loggedIn:true}; }
+  try{ localStorage.removeItem('carnet-cache-v1'); localStorage.removeItem('carnet-courses-v1'); }catch{}   // anciens caches communs
   if(cfg.auth && !cfg.loggedIn){ showLogin(); return; }
+  if(cfg.email){ CACHE_KEY+=':'+cfg.email; SHOP_KEY+=':'+cfg.email;
+    $('#acc-initial').textContent=cfg.email.charAt(0); $('#btn-account').hidden=false; $('#btn-account').title=cfg.email; }
   await loadRecipes(); loadShop();
   handleShare();
   const h=location.hash; if(h.startsWith('#r-')){ const id=h.slice(3); if(recipes.find(r=>r.id===id)){ history.replaceState(null,'',location.pathname); openDetail(id); } }
